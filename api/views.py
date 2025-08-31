@@ -122,12 +122,13 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
         }
 
     url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "Referer": APP_PUBLIC_URL",
-        "X-Title": "CreatorFlowAI",
-    }
+headers = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
+    "Referer": APP_PUBLIC_URL,
+    "X-Title": "CreatorFlowAI",
+}
+
     payload = {
         "model": model,
         "messages": messages,

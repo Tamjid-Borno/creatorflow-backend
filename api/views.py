@@ -37,41 +37,40 @@ RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 MODEL_TEMPERATURE: float = float(config("MODEL_TEMPERATURE", default="0.7"))
 MODEL_TOP_P: float = float(config("MODEL_TOP_P", default="0.9"))
-MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="450"))  # fits 100–150 words comfortably
+MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="450"))
 
 SYSTEM_PROMPT = (
     "You are a professional Instagram Reels scriptwriter. "
-    "Write emotionally engaging, high-retention scripts optimized for 30–60 seconds (~100–150 words total). "
+    "Write emotionally engaging, high-retention scripts optimized for 30–60 seconds. "
     "You MUST return ONLY the three labeled sections, exactly in this order, with a blank line between each:\n\n"
     "Hook: ...\n\n"
     "Body: ...\n\n"
     "CTA: ...\n\n"
     "Rules:\n"
     "- Voice: spoken, natural English with contractions and plain words. No corporate or robotic phrasing.\n"
-    "- Ban words/phrases that feel AI-scented: embark, realm, transcend, unveil, discourse, insight, leverage (as a noun), "
+    "- Ban AI-scented words: embark, realm, transcend, unveil, discourse, insight, leverage (as a noun), "
     "unlock your potential, embrace, journey, harness, thus, hereby.\n"
-    "- Hook: one sentence, bold/specific/curiosity-driving. No generic questions like “Are you a content creator…?”. "
+    "- Hook: ONE sentence, bold/specific/curiosity-driving. No generic questions like “Are you a content creator…?”. "
     "Prefer claims, numbers, or pattern breaks.\n"
-    "- Body: short sentences (spoken cadence). Show one emotional shift (e.g., overwhelm→control, regret→hope). "
-    "Deliver real value with a tiny framework, example, or 2–3 concrete steps (e.g., a sample prompt or timing).\n"
-    "- Match the creator’s niche, follower level, tone, and any specific topic tightly.\n"
-    "- Format: no extra sections, no preamble, no postscript, no hashtags, no emoji spam (a single emoji is okay in CTA if natural), "
-    "no markdown, no bullet lists outside of the Body (and even there, prefer flowing sentences).\n"
-    "- Length: 100–150 words TOTAL across Hook+Body+CTA (do not exceed 150). Prioritize punchiness over length.\n"
-    "- CTA: 1–2 lines, highly clickable and tied to the content (e.g., “Comment ‘me’ for the prompts”, "
-    "“Follow for creator workflows”, “Send this to someone who needs it”).\n"
+    "- Body: short sentences (spoken cadence). Show one emotional shift (e.g., overwhelm→control). "
+    "Deliver a tiny framework, example, or 2–3 concrete steps.\n"
+    "- Tight match to niche, follower level, tone, and topic.\n"
+    "- Format: no extra sections, no preamble/postscript, no hashtags, no emoji spam, no markdown formatting.\n"
+    "- Length: ~90–120 words TOTAL across Hook+Body+CTA (do not exceed 120).\n"
+    "- CTA: 1–2 lines, highly clickable and tied to the content.\n"
     "- If you produce anything outside the exact Hook/Body/CTA structure, FIX IT and produce only the three sections.\n"
 )
 
 # --- Stepwise (Premium-only) prompts -----------------------------------------
 HOOK_SYSTEM_PROMPT = (
     "You are a professional IG Reels HOOK specialist. "
-    "Return ONLY one line labeled exactly 'Hook:' with a punchy, curiosity-driving sentence. No extra text."
+    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words). "
+    "No newlines, no bullets, no markdown, no bold, no quotes, no extra text."
 )
 BODY_SYSTEM_PROMPT = (
     "You are a professional IG Reels BODY writer. "
-    "Return ONLY the Body labeled exactly 'Body:' in 80–120 words, "
-    "spoken cadence, concrete examples/mini-framework. Do not restate the Hook. No extra sections."
+    "Return ONLY the Body labeled exactly 'Body:' in around 60–90 words, "
+    "spoken cadence, concrete example or 2–3 quick steps, and do NOT restate the Hook. No extra sections."
 )
 CTA_SYSTEM_PROMPT = (
     "You are a professional IG Reels CTA copywriter. "
@@ -99,8 +98,8 @@ def build_user_prompt(
     specific = f" The script should revolve around: '{more_specific}'." if more_specific else ""
     guidance = (
         " Make it sound like spoken language, not an essay. "
-        "Include one emotional shift and at least one concrete example, 2–3 steps, or a mini workflow "
-        "relevant to my audience level. Keep total length ~110–140 words."
+        "Include one emotional shift and at least one concrete example or 2–3 steps "
+        "relevant to my audience level. Keep total length ~90–120 words."
     )
     return base + specific + guidance
 
@@ -222,32 +221,35 @@ def _normalize_sections(text: str) -> str:
     if not text:
         return text
 
-    # unify line endings
     t = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # strip triple backtick fences if model wrapped output
     t = re.sub(r"^```(?:\w+)?\n", "", t)
     t = re.sub(r"\n```$", "", t)
-
-    # fix "Hok:" specifically, case-insensitive, at start of a line
     t = re.sub(r"(?im)^\s*hok\s*:", "Hook:", t)
-
-    # normalize canonical headers at line start (case-insensitive)
     t = re.sub(r"(?im)^\s*hook\s*:", "Hook:", t)
     t = re.sub(r"(?im)^\s*body\s*:", "Body:", t)
     t = re.sub(r"(?im)^\s*cta\s*:",  "CTA:",  t)
-
-    # remove any trailing 'undefined' (possibly repeated with spaces/newlines)
     t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).rstrip()
-
     return t
 
+# --- Premium output sanitizers ------------------------------------------------
+def _strip_md_noise(s: str) -> str:
+    return re.sub(r"[*_`>#~]+", "", (s or "")).strip()
 
-# --- Premium helpers ----------------------------------------------------------
+def _ensure_end_punct(s: str) -> str:
+    return s if re.search(r"[.!?]$", s or "") else (s + "." if s else s)
+
+def _first_sentence_or_line(s: str) -> str:
+    s = (s or "").splitlines()[0].strip()
+    m = re.search(r"^(.+?[.!?])(\s|$)", s)
+    return (m.group(1).strip() if m else s)
+
+def _cap_words(s: str, max_words: int) -> str:
+    words = (s or "").split()
+    if len(words) <= max_words:
+        return s
+    return " ".join(words[:max_words]).rstrip(",;:–-") + "…"
+
 def _extract_after_label(text: str, label: str) -> str:
-    """
-    Accepts either 'Label: content' or just raw content. Strips trailing 'undefined'.
-    """
     t = (text or "").strip()
     m = re.search(rf"(?is)\b{re.escape(label)}\s*:\s*(.*)", t)
     if m:
@@ -255,7 +257,33 @@ def _extract_after_label(text: str, label: str) -> str:
     t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).strip()
     return t
 
+def _tighten_hook(raw: str) -> str:
+    t = _extract_after_label(raw, "Hook")
+    t = _strip_md_noise(t)
+    t = _first_sentence_or_line(t)
+    t = _cap_words(t, 16)  # ~8–16 words
+    return _ensure_end_punct(t)
 
+def _tighten_body(raw: str) -> str:
+    t = _extract_after_label(raw, "Body")
+    t = _strip_md_noise(t)
+    # collapse bullets if present
+    t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)
+    # compress whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    # cap around 90 words (target 60–90)
+    t = _cap_words(t, 90)
+    return _ensure_end_punct(t)
+
+def _tighten_cta(raw: str) -> str:
+    t = _extract_after_label(raw, "CTA")
+    t = _strip_md_noise(t)
+    # one or two short lines → just keep concise text
+    t = _first_sentence_or_line(t)
+    t = _cap_words(t, 20)
+    return _ensure_end_punct(t)
+
+# --- Firestore (best-effort) --------------------------------------------------
 def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
     """
     Best-effort Firestore fetch. If firebase_admin is not configured, returns None gracefully.
@@ -282,7 +310,6 @@ def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
     except Exception:
         logger.exception("Firestore not available or query failed")
     return None
-
 
 # -----------------------------------------------------------------------------
 # View: generate_review
@@ -322,7 +349,7 @@ def generate_review(request: HttpRequest):
         ]
         hook_raw, hook_meta, hook_err = generate_with_fallback(hook_msgs)
         if hook_raw:
-            hook = _extract_after_label(hook_raw, "Hook")
+            hook = _tighten_hook(hook_raw)
 
             # 2) BODY (conditioned on Hook)
             body_msgs = [
@@ -335,7 +362,7 @@ def generate_review(request: HttpRequest):
             body_raw, body_meta, body_err = generate_with_fallback(body_msgs)
 
             if body_raw:
-                body_txt = _extract_after_label(body_raw, "Body")
+                body_txt = _tighten_body(body_raw)
 
                 # 3) CTA (conditioned on Body)
                 cta_msgs = [
@@ -348,7 +375,7 @@ def generate_review(request: HttpRequest):
                 cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs)
 
                 if cta_raw:
-                    cta_txt = _extract_after_label(cta_raw, "CTA")
+                    cta_txt = _tighten_cta(cta_raw)
                     combined = f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}"
                     cleaned = _normalize_sections(combined.strip())
                     meta = {
@@ -361,12 +388,16 @@ def generate_review(request: HttpRequest):
                     return JsonResponse({"response": cleaned, "meta": meta}, status=200)
 
             # If Body or CTA failed, fall through to one-shot fallback
-            logger.warning("Stepwise failed (Body/CTA). Falling back to one-shot. "
-                           "hook_err=%s body_err=%s", hook_err, body_err if 'body_err' in locals() else None)
+            logger.warning(
+                "Stepwise failed (Body/CTA). Falling back to one-shot. hook_err=%s body_err=%s cta_err=%s",
+                hook_err,
+                body_err if 'body_err' in locals() else None,
+                cta_err if 'cta_err' in locals() else None,
+            )
         else:
             logger.warning("Stepwise failed (Hook). Falling back to one-shot. err=%s", hook_err)
 
-    # ---- Default / Fallback: one-shot Hook+Body+CTA as before ----
+    # ---- Default / Fallback: one-shot Hook+Body+CTA ----
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": user_prompt},
@@ -382,7 +413,6 @@ def generate_review(request: HttpRequest):
     if DEBUG_MODE and upstream_err:
         payload["upstream"] = upstream_err
     return JsonResponse(payload, status=status_code)
-
 
 # -----------------------------------------------------------------------------
 #                            Health endpoint

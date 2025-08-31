@@ -29,15 +29,18 @@ OPENROUTER_MODEL_PRIMARY: str = config("OPENROUTER_MODEL_PRIMARY", default="open
 OPENROUTER_MODEL_FALLBACK: str = config("OPENROUTER_MODEL_FALLBACK", default="meta-llama/llama-3.1-70b-instruct")
 APP_PUBLIC_URL: str = config("APP_PUBLIC_URL", default="http://127.0.0.1:8000")
 
-CONNECT_TIMEOUT: float = float(config("LLM_CONNECT_TIMEOUT", default="5"))
-READ_TIMEOUT: float = float(config("LLM_READ_TIMEOUT", default="60"))
+# Keep app-level ceilings BELOW your Gunicorn timeout
+CONNECT_TIMEOUT: float = float(config("LLM_CONNECT_TIMEOUT", default="10"))
+READ_TIMEOUT: float = float(config("LLM_READ_TIMEOUT", default="35"))
+
 MAX_RETRIES: int = int(config("LLM_MAX_RETRIES", default="2"))
 RETRY_BACKOFF_SECONDS: float = float(config("LLM_RETRY_BACKOFF_SECONDS", default="0.8"))
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 MODEL_TEMPERATURE: float = float(config("MODEL_TEMPERATURE", default="0.7"))
 MODEL_TOP_P: float = float(config("MODEL_TOP_P", default="0.9"))
-MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="450"))
+# Keep responses compact to reduce latency
+MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="400"))
 
 SYSTEM_PROMPT = (
     "You are a professional Instagram Reels scriptwriter. "
@@ -116,6 +119,11 @@ def build_user_prompt(
 
 
 def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    Calls a specific OpenRouter model with retries on transient errors.
+    Returns (content, meta, error). If error and status == 402, code is PAYMENT_REQUIRED
+    so callers can fast-fail instead of wasting time on further calls.
+    """
     if not OPENROUTER_API_KEY:
         return None, {"status": 0, "tries": 0, "latency_ms": 0, "model": model}, {
             "code": "SERVER_CONFIG", "message": "Missing OPENROUTER_API_KEY."
@@ -135,6 +143,7 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
         "top_p": MODEL_TOP_P,
         "max_tokens": MODEL_MAX_TOKENS,
         "stop": ["</script>"],
+        "stream": False,
     }
 
     tries = 0
@@ -150,13 +159,28 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
             last_status = resp.status_code
 
             if resp.status_code >= 400:
+                # Special-case 402 so upstream payment issues short-circuit callers
+                if resp.status_code == 402:
+                    try:
+                        upstream = resp.json()
+                    except Exception:
+                        upstream = {"raw": resp.text[:1000]}
+                    error = {
+                        "code": "PAYMENT_REQUIRED",
+                        "message": "402 from OpenRouter",
+                        "upstream": upstream if DEBUG_MODE else {"hint": "Enable DEBUG to see upstream body"},
+                    }
+                    break
+
                 try:
                     upstream = resp.json()
                 except Exception:
                     upstream = {"raw": resp.text[:1000]}
+
                 if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
                     time.sleep(RETRY_BACKOFF_SECONDS * tries)
                     continue
+
                 error = {
                     "code": "UPSTREAM_ERROR",
                     "message": f"{resp.status_code} from OpenRouter",
@@ -197,9 +221,15 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
 
 
 def generate_with_fallback(messages: List[Dict[str, str]]) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    Try primary; if it fails, do a single-shot on the fallback model.
+    This keeps total request count low and avoids long stepwise cascades when the primary is down/402.
+    """
     content, meta, err = call_openrouter(messages, OPENROUTER_MODEL_PRIMARY)
     if content:
         return content, meta, None
+
+    # If the primary is unavailable, call fallback once (single-shot)
     logger.warning("Primary model failed: %s | Falling back to %s", err, OPENROUTER_MODEL_FALLBACK)
     content2, meta2, err2 = call_openrouter(messages, OPENROUTER_MODEL_FALLBACK)
     if content2:
@@ -224,7 +254,6 @@ def _limit_words(text: str, max_words: int = 40) -> str:
 def _normalize_sections(text: str) -> str:
     """
     Fix common model slip-ups:
-    - 'Hok:' -> 'Hook:'
     - normalize case of 'hook/body/cta' at line starts
     - remove trailing 'undefined' tokens
     - trim stray backticks/markdown fences if any
@@ -337,8 +366,7 @@ def _cta_needs_reforge(c: str) -> bool:
         return True
     too_long = len(c.split()) > 24
     lacks_imperative = ACTION_VERBS_RE.search(c) is None
-    # prefer addressing the viewer
-    lacks_you_hint = YOU_RE.search(c) is None
+    lacks_you_hint = YOU_RE.search(c) is None  # prefer addressing the viewer
     return too_long or lacks_imperative or lacks_you_hint
 
 REFORGE_CTA_SYSTEM_PROMPT = (
@@ -366,11 +394,13 @@ def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
         if uid:
             snap = db.collection("users").document(uid.strip()).get()
             if snap and snap.exists:
+                logger.info("Firestore initialized successfully.")
                 return snap.to_dict()
 
         if email:
             q = db.collection("users").where("email", "==", email.strip()).limit(1).get()
             if q:
+                logger.info("Firestore initialized successfully.")
                 return q[0].to_dict()
     except Exception:
         logger.exception("Firestore not available or query failed")
@@ -406,16 +436,20 @@ def generate_review(request: HttpRequest):
     user_prompt = build_user_prompt(niche, sub_category, follower_count, tone, more_specific)
 
     # ---- Premium stepwise: Hook -> Body -> CTA ----
+    # IMPORTANT: We *only* attempt stepwise if the primary is reachable.
+    # If the very first HOOK call on primary fails (e.g., 402), we skip stepwise entirely
+    # and do a single-shot on the fallback to avoid cascading timeouts.
     if plan == "Premium":
         body_err = None
         cta_err = None
 
-        # 1) HOOK
+        # 1) HOOK (PRIMARY ONLY to probe availability)
         hook_msgs = [
             {"role": "system", "content": HOOK_SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt},
         ]
-        hook_raw, hook_meta, hook_err = generate_with_fallback(hook_msgs)
+        hook_raw, hook_meta, hook_err = call_openrouter(hook_msgs, OPENROUTER_MODEL_PRIMARY)
+
         if hook_raw:
             hook = _tighten_hook(hook_raw)
 
@@ -432,7 +466,7 @@ def generate_review(request: HttpRequest):
                 if reforged_raw:
                     hook = _tighten_hook(reforged_raw)
 
-            # 2) BODY (conditioned on Hook)
+            # 2) BODY (conditioned on Hook) — ok to use fallback now
             body_msgs = [
                 {"role": "system", "content": BODY_SYSTEM_PROMPT},
                 {
@@ -500,7 +534,7 @@ def generate_review(request: HttpRequest):
                 hook_err, body_err, cta_err
             )
         else:
-            logger.warning("Stepwise failed (Hook). Falling back to one-shot. err=%s", hook_err)
+            logger.warning("Stepwise skipped: primary unavailable for HOOK (err=%s). Using one-shot fallback.", hook_err)
 
     # ---- Default / Fallback: one-shot Hook+Body+CTA ----
     messages = [
@@ -519,11 +553,12 @@ def generate_review(request: HttpRequest):
         payload["upstream"] = upstream_err
     return JsonResponse(payload, status=status_code)
 
-# -----------------------------------------------------------------------------
-# Health endpoint
-# -----------------------------------------------------------------------------
-def health(_request):
-    return JsonResponse({"ok": True})
+
+# Optional tiny health endpoint you can map in urls.py to silence uptime 404s.
+@csrf_exempt
+def health(request: HttpRequest):
+    return JsonResponse({"ok": True, "service": "creatorflow-backend"}, status=200)
+
 
 
 # -----------------------------------------------------------------------------

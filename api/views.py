@@ -1,23 +1,20 @@
 # myproject/api/views.py
 from __future__ import annotations
-import base64
+
 import json
-import time
 import logging
-from typing import Tuple, Optional, Dict, Any, List
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from decouple import config
-from django.http import JsonResponse, HttpRequest, HttpResponseBadRequest
+from django.http import JsonResponse, HttpRequest
 from django.views.decorators.csrf import csrf_exempt
 
-logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
-#                     L O G G I N G   (dev-friendly defaults)
+# Logging (dev-friendly defaults). In production, rely on settings.py.
 # -----------------------------------------------------------------------------
-# If your settings.py doesn't configure logging, this ensures you see INFO logs
-# from this module while developing. In production, rely on settings.py.
-import logging
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,17 +22,6 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 #                OpenRouter (generate-review) configuration
 # -----------------------------------------------------------------------------
-import time
-import re
-import json
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests
-from decouple import config
-
-from django.http import JsonResponse, HttpRequest
-from django.views.decorators.csrf import csrf_exempt
-
 DEBUG_MODE: bool = config("DEBUG", default="false").lower() == "true"
 
 OPENROUTER_API_KEY: str = config("OPENROUTER_API_KEY", default="")
@@ -51,7 +37,7 @@ RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 MODEL_TEMPERATURE: float = float(config("MODEL_TEMPERATURE", default="0.7"))
 MODEL_TOP_P: float = float(config("MODEL_TOP_P", default="0.9"))
-MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="450"))  # 100–150 words comfortably fits
+MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="450"))  # fits 100–150 words comfortably
 
 SYSTEM_PROMPT = (
     "You are a professional Instagram Reels scriptwriter. "
@@ -69,7 +55,7 @@ SYSTEM_PROMPT = (
     "- Body: short sentences (spoken cadence). Show one emotional shift (e.g., overwhelm→control, regret→hope). "
     "Deliver real value with a tiny framework, example, or 2–3 concrete steps (e.g., a sample prompt or timing).\n"
     "- Match the creator’s niche, follower level, tone, and any specific topic tightly.\n"
-    "- Format: no extra sections, no preamble, no postscript, no hashtags, no emojis spam (a single emoji is okay in CTA if natural), "
+    "- Format: no extra sections, no preamble, no postscript, no hashtags, no emoji spam (a single emoji is okay in CTA if natural), "
     "no markdown, no bullet lists outside of the Body (and even there, prefer flowing sentences).\n"
     "- Length: 100–150 words TOTAL across Hook+Body+CTA (do not exceed 150). Prioritize punchiness over length.\n"
     "- CTA: 1–2 lines, highly clickable and tied to the content (e.g., “Comment ‘me’ for the prompts”, "
@@ -77,6 +63,25 @@ SYSTEM_PROMPT = (
     "- If you produce anything outside the exact Hook/Body/CTA structure, FIX IT and produce only the three sections.\n"
 )
 
+# --- Stepwise (Premium-only) prompts -----------------------------------------
+HOOK_SYSTEM_PROMPT = (
+    "You are a professional IG Reels HOOK specialist. "
+    "Return ONLY one line labeled exactly 'Hook:' with a punchy, curiosity-driving sentence. No extra text."
+)
+BODY_SYSTEM_PROMPT = (
+    "You are a professional IG Reels BODY writer. "
+    "Return ONLY the Body labeled exactly 'Body:' in 80–120 words, "
+    "spoken cadence, concrete examples/mini-framework. Do not restate the Hook. No extra sections."
+)
+CTA_SYSTEM_PROMPT = (
+    "You are a professional IG Reels CTA copywriter. "
+    "Return ONLY the CTA labeled exactly 'CTA:' in 1–2 short lines, "
+    "highly clickable and tied to the Body. No extra sections."
+)
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def build_user_prompt(
     niche: str,
     sub_category: str,
@@ -98,6 +103,7 @@ def build_user_prompt(
         "relevant to my audience level. Keep total length ~110–140 words."
     )
     return base + specific + guidance
+
 
 def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
     if not OPENROUTER_API_KEY:
@@ -179,6 +185,7 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
     meta = {"status": last_status or 0, "tries": tries, "latency_ms": latency_ms, "model": model}
     return content, meta, error
 
+
 def generate_with_fallback(messages: List[Dict[str, str]]) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
     content, meta, err = call_openrouter(messages, OPENROUTER_MODEL_PRIMARY)
     if content:
@@ -190,6 +197,7 @@ def generate_with_fallback(messages: List[Dict[str, str]]) -> Tuple[Optional[str
     combined_err = {"primary": err, "fallback": err2}
     return None, meta2, combined_err
 
+
 def _norm(s: Any) -> str:
     if not s:
         return ""
@@ -197,9 +205,11 @@ def _norm(s: Any) -> str:
         s = str(s)
     return s.replace("\n", " ").replace("\r", " ").strip()
 
+
 def _limit_words(text: str, max_words: int = 40) -> str:
     words = text.split()
     return text if len(words) <= max_words else " ".join(words[:max_words])
+
 
 def _normalize_sections(text: str) -> str:
     """
@@ -232,6 +242,51 @@ def _normalize_sections(text: str) -> str:
 
     return t
 
+
+# --- Premium helpers ----------------------------------------------------------
+def _extract_after_label(text: str, label: str) -> str:
+    """
+    Accepts either 'Label: content' or just raw content. Strips trailing 'undefined'.
+    """
+    t = (text or "").strip()
+    m = re.search(rf"(?is)\b{re.escape(label)}\s*:\s*(.*)", t)
+    if m:
+        t = m.group(1).strip()
+    t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).strip()
+    return t
+
+
+def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
+    """
+    Best-effort Firestore fetch. If firebase_admin is not configured, returns None gracefully.
+    Looks up by uid first, then by email.
+    """
+    try:
+        import firebase_admin
+        from firebase_admin import firestore as fs
+
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+
+        db = fs.client()
+
+        if uid:
+            snap = db.collection("users").document(uid.strip()).get()
+            if snap and snap.exists:
+                return snap.to_dict()
+
+        if email:
+            q = db.collection("users").where("email", "==", email.strip()).limit(1).get()
+            if q:
+                return q[0].to_dict()
+    except Exception:
+        logger.exception("Firestore not available or query failed")
+    return None
+
+
+# -----------------------------------------------------------------------------
+# View: generate_review
+# -----------------------------------------------------------------------------
 @csrf_exempt
 def generate_review(request: HttpRequest):
     if request.method != "POST":
@@ -248,24 +303,86 @@ def generate_review(request: HttpRequest):
     tone = _norm(body.get("tone", ""))
     more_specific = _limit_words(_norm(body.get("moreSpecific", "")), 30)
 
+    # Optional identity to detect Premium
+    uid = _norm(body.get("uid", ""))
+    email = _norm(body.get("email", ""))
+
+    # Try to read user doc; if not found, plan stays empty → one-shot path
+    user_doc = _get_user_doc(uid or None, email or None)
+    plan = (user_doc or {}).get("subscriptionPlan", "").strip().title()
+
     user_prompt = build_user_prompt(niche, sub_category, follower_count, tone, more_specific)
+
+    # ---- Premium stepwise: Hook -> Body -> CTA ----
+    if plan == "Premium":
+        # 1) HOOK
+        hook_msgs = [
+            {"role": "system", "content": HOOK_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ]
+        hook_raw, hook_meta, hook_err = generate_with_fallback(hook_msgs)
+        if hook_raw:
+            hook = _extract_after_label(hook_raw, "Hook")
+
+            # 2) BODY (conditioned on Hook)
+            body_msgs = [
+                {"role": "system", "content": BODY_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"{user_prompt}\n\nUse this Hook (do not repeat it verbatim):\n{hook}",
+                },
+            ]
+            body_raw, body_meta, body_err = generate_with_fallback(body_msgs)
+
+            if body_raw:
+                body_txt = _extract_after_label(body_raw, "Body")
+
+                # 3) CTA (conditioned on Body)
+                cta_msgs = [
+                    {"role": "system", "content": CTA_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"{user_prompt}\n\nHere is the Body to build a CTA for:\n{body_txt}",
+                    },
+                ]
+                cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs)
+
+                if cta_raw:
+                    cta_txt = _extract_after_label(cta_raw, "CTA")
+                    combined = f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}"
+                    cleaned = _normalize_sections(combined.strip())
+                    meta = {
+                        "mode": "premium_stepwise",
+                        "hook": hook_meta,
+                        "body": body_meta,
+                        "cta": cta_meta,
+                    }
+                    logger.info("Premium stepwise content: %r", cleaned[:2000])
+                    return JsonResponse({"response": cleaned, "meta": meta}, status=200)
+
+            # If Body or CTA failed, fall through to one-shot fallback
+            logger.warning("Stepwise failed (Body/CTA). Falling back to one-shot. "
+                           "hook_err=%s body_err=%s", hook_err, body_err if 'body_err' in locals() else None)
+        else:
+            logger.warning("Stepwise failed (Hook). Falling back to one-shot. err=%s", hook_err)
+
+    # ---- Default / Fallback: one-shot Hook+Body+CTA as before ----
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+        {"role": "user",   "content": user_prompt},
     ]
-
     content, meta, upstream_err = generate_with_fallback(messages)
     if content:
         cleaned = _normalize_sections(content.strip())
-        # (Optional) log to confirm no 'undefined' is returning from backend
-        logger.info("Final cleaned content: %r", cleaned[:2000])
-        return JsonResponse({"response": cleaned, "meta": meta}, status=200)
+        logger.info("Final cleaned content (single-shot): %r", cleaned[:2000])
+        return JsonResponse({"response": cleaned, "meta": {"mode": "single_shot", **meta}}, status=200)
 
     status_code = 502
     payload = {"error": "Upstream model failed", "meta": meta}
     if DEBUG_MODE and upstream_err:
         payload["upstream"] = upstream_err
     return JsonResponse(payload, status=status_code)
+
 
 # -----------------------------------------------------------------------------
 #                            Health endpoint

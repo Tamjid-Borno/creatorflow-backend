@@ -51,13 +51,13 @@ SYSTEM_PROMPT = (
     "- Ban AI-scented words: embark, realm, transcend, unveil, discourse, insight, leverage (as a noun), "
     "unlock your potential, embrace, journey, harness, thus, hereby.\n"
     "- Hook: ONE sentence, bold/specific/curiosity-driving. No generic questions like “Are you a content creator…?”. "
-    "Prefer claims, numbers, or pattern breaks.\n"
+    "Prefer claims, numbers, or pattern breaks; speak to one viewer using 'you/your'.\n"
     "- Body: short sentences (spoken cadence). Show one emotional shift (e.g., overwhelm→control). "
-    "Deliver a tiny framework, example, or 2–3 concrete steps.\n"
+    "Provide a tiny framework, example, or 2–3 concrete steps with benefit-first phrasing; talk to ONE viewer ('you/your').\n"
     "- Tight match to niche, follower level, tone, and topic.\n"
     "- Format: no extra sections, no preamble/postscript, no hashtags, no emoji spam, no markdown formatting.\n"
     "- Length: ~80–110 words TOTAL across Hook+Body+CTA (do not exceed 110).\n"
-    "- CTA: 1–2 lines, highly clickable and tied to the content.\n"
+    "- CTA: 1–2 lines, imperative and highly clickable, tied to the content, speaking to ONE viewer ('you/your').\n"
     "- If you produce anything outside the exact Hook/Body/CTA structure, FIX IT and produce only the three sections.\n"
 )
 
@@ -77,13 +77,16 @@ HOOK_SYSTEM_PROMPT = (
 )
 BODY_SYSTEM_PROMPT = (
     "You are a professional IG Reels BODY writer. "
-    "Return ONLY the Body labeled exactly 'Body:' in around 60–90 words, "
-    "spoken cadence, concrete example or 2–3 quick steps, and do NOT restate the Hook. No extra sections."
+    "Return ONLY the Body labeled exactly 'Body:' in around 60–90 words. "
+    "Talk directly to ONE viewer using 'you/your'. Start with empathy (pain/desire), then give a micro-story "
+    "or vivid moment, then 2–3 concrete, easy steps (benefit-first phrasing). Use spoken cadence and contractions. "
+    "Do NOT restate the Hook. No extra sections."
 )
 CTA_SYSTEM_PROMPT = (
     "You are a professional IG Reels CTA copywriter. "
-    "Return ONLY the CTA labeled exactly 'CTA:' in 1–2 short lines, "
-    "highly clickable and tied to the Body. No extra sections."
+    "Return ONLY the CTA labeled exactly 'CTA:' in 1–2 short lines. "
+    "Use an imperative verb directed at ONE viewer ('you/your'), tie it to the Body's promise, "
+    "and keep it frictionless (e.g., 'Save this', 'Comment \"me\"', 'Follow for X'). No extra sections."
 )
 
 # -----------------------------------------------------------------------------
@@ -122,7 +125,7 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "Referer": APP_PUBLIC_URL,
+        "Referer": APP_PUBLIC_URL",
         "X-Title": "CreatorFlowAI",
     }
     payload = {
@@ -240,8 +243,9 @@ def _normalize_sections(text: str) -> str:
     return t
 
 # --- Premium output sanitizers & quality gates --------------------------------
-GENERIC_Q_RE = re.compile(r"(?i)\b(ever wonder|have you ever|are you( a)?|did you know|do you)\b")
-YOU_RE = re.compile(r"(?i)\byou(?:r|’re|\'re|\b)")
+GENERIC_Q_RE = re.compile(r"(?i)\b(ever wonder|have you ever|are you( a)?|did you know|in today'?s (video|reel)|in this video|let'?s dive in)\b")
+YOU_RE = re.compile(r"(?i)\byou(?:r|’re|'re|\b)")
+ACTION_VERBS_RE = re.compile(r"(?i)\b(save|comment|follow|dm|share|tap|try|use|apply|post|record|write|build|launch|fix|download|grab|join|watch|bookmark)\b")
 
 def _strip_md_noise(s: str) -> str:
     return re.sub(r"[*_`>#~]+", "", (s or "")).strip()
@@ -268,6 +272,7 @@ def _extract_after_label(text: str, label: str) -> str:
     t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).strip()
     return t
 
+# --- Hook: tighten + gate + (optional) reforge --------------------------------
 def _tighten_hook(raw: str) -> str:
     t = _extract_after_label(raw, "Hook")
     t = _strip_md_noise(t)
@@ -291,21 +296,57 @@ REFORGE_HOOK_SYSTEM_PROMPT = (
     "Name a concrete pain/desire early; avoid generic questions; no markdown/quotes/emojis.\n"
 )
 
+# --- Body: tighten + gate + (optional) reforge --------------------------------
 def _tighten_body(raw: str) -> str:
     t = _extract_after_label(raw, "Body")
     t = _strip_md_noise(t)
     t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)  # drop bullets
     t = re.sub(r"\s+", " ", t).strip()
-    # cap around 80 words (average reel body)
-    t = _cap_words(t, 80)
+    t = _cap_words(t, 80)  # average reel body 60–90 words; cap ~80
     return _ensure_end_punct(t)
 
+def _body_needs_reforge(b: str) -> bool:
+    if not b:
+        return True
+    words = b.split()
+    too_short = len(words) < 50
+    too_long  = len(words) > 100
+    lacks_you = YOU_RE.search(b) is None
+    has_generic = GENERIC_Q_RE.search(b) is not None
+    lacks_action = ACTION_VERBS_RE.search(b) is None
+    return too_short or too_long or lacks_you or has_generic or lacks_action
+
+REFORGE_BODY_SYSTEM_PROMPT = (
+    "You rewrite the BODY of an IG Reel to be persuasive and human.\n"
+    "Return ONLY 'Body:' followed by ~60–90 words addressing ONE viewer using 'you/your'.\n"
+    "Start with empathy (pain/desire), include a vivid mini-moment or micro-story, "
+    "then give 2–3 concrete steps or a tiny framework with benefit-first phrasing. "
+    "Use short spoken sentences and contractions. Avoid generic openers and buzzwords. No extra sections."
+)
+
+# --- CTA: tighten + gate + (optional) reforge ---------------------------------
 def _tighten_cta(raw: str) -> str:
     t = _extract_after_label(raw, "CTA")
     t = _strip_md_noise(t)
     t = _first_sentence_or_line(t)
     t = _cap_words(t, 20)
     return _ensure_end_punct(t)
+
+def _cta_needs_reforge(c: str) -> bool:
+    if not c:
+        return True
+    too_long = len(c.split()) > 24
+    lacks_imperative = ACTION_VERBS_RE.search(c) is None
+    # prefer addressing the viewer
+    lacks_you_hint = YOU_RE.search(c) is None
+    return too_long or lacks_imperative or lacks_you_hint
+
+REFORGE_CTA_SYSTEM_PROMPT = (
+    "You rewrite CTAs to be clear, human, and high-converting.\n"
+    "Return ONLY 'CTA:' followed by 1 short line (max ~16 words) speaking to ONE viewer using 'you/your'.\n"
+    "Start with an imperative verb aligned to the Body (e.g., Save, Comment 'me', Follow, DM, Share). "
+    "Keep it frictionless and specific. No emojis, no hashtags, no extra sections."
+)
 
 # --- Firestore (best-effort) --------------------------------------------------
 def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
@@ -378,7 +419,7 @@ def generate_review(request: HttpRequest):
         if hook_raw:
             hook = _tighten_hook(hook_raw)
 
-            # Quality gate: enforce second-person, non-generic, punchy
+            # Hook quality gate (second-person, non-generic, punchy)
             if _hook_needs_reforge(hook):
                 reforged_raw, _, _ = generate_with_fallback([
                     {"role": "system", "content": REFORGE_HOOK_SYSTEM_PROMPT},
@@ -404,6 +445,19 @@ def generate_review(request: HttpRequest):
             if body_raw:
                 body_txt = _tighten_body(body_raw)
 
+                # Body quality gate (human, persuasive, concrete)
+                if _body_needs_reforge(body_txt):
+                    reforged_body_raw, _, _ = generate_with_fallback([
+                        {"role": "system", "content": REFORGE_BODY_SYSTEM_PROMPT},
+                        {"role": "user", "content": (
+                            f"{user_prompt}\n\n"
+                            f"Rewrite this Body to be more human, persuasive, and concrete (60–90 words):\n"
+                            f"Body: {body_txt}"
+                        )},
+                    ])
+                    if reforged_body_raw:
+                        body_txt = _tighten_body(reforged_body_raw)
+
                 # 3) CTA (conditioned on Body)
                 cta_msgs = [
                     {"role": "system", "content": CTA_SYSTEM_PROMPT},
@@ -416,6 +470,19 @@ def generate_review(request: HttpRequest):
 
                 if cta_raw:
                     cta_txt = _tighten_cta(cta_raw)
+
+                    # CTA quality gate (imperative, viewer-directed, concise)
+                    if _cta_needs_reforge(cta_txt):
+                        reforged_cta_raw, _, _ = generate_with_fallback([
+                            {"role": "system", "content": REFORGE_CTA_SYSTEM_PROMPT},
+                            {"role": "user", "content": (
+                                f"{user_prompt}\n\n"
+                                f"Rewrite this CTA to be imperative, viewer-directed, and specific:\nCTA: {cta_txt}"
+                            )},
+                        ])
+                        if reforged_cta_raw:
+                            cta_txt = _tighten_cta(reforged_cta_raw)
+
                     combined = f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}"
                     cleaned = _normalize_sections(combined.strip())
                     meta = {

@@ -56,16 +56,24 @@ SYSTEM_PROMPT = (
     "Deliver a tiny framework, example, or 2–3 concrete steps.\n"
     "- Tight match to niche, follower level, tone, and topic.\n"
     "- Format: no extra sections, no preamble/postscript, no hashtags, no emoji spam, no markdown formatting.\n"
-    "- Length: ~90–120 words TOTAL across Hook+Body+CTA (do not exceed 120).\n"
+    "- Length: ~80–110 words TOTAL across Hook+Body+CTA (do not exceed 110).\n"
     "- CTA: 1–2 lines, highly clickable and tied to the content.\n"
     "- If you produce anything outside the exact Hook/Body/CTA structure, FIX IT and produce only the three sections.\n"
 )
 
 # --- Stepwise (Premium-only) prompts -----------------------------------------
 HOOK_SYSTEM_PROMPT = (
-    "You are a professional IG Reels HOOK specialist. "
-    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words). "
-    "No newlines, no bullets, no markdown, no bold, no quotes, no extra text."
+    "You are a professional IG Reels HOOK specialist.\n"
+    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words).\n"
+    "Absolute rules:\n"
+    "- Speak directly to ONE viewer using second person ('you/your').\n"
+    "- Name a concrete pain, desire, or moment in the first 3–5 words.\n"
+    "- Use present tense and everyday words; sound human and conversational.\n"
+    "- Create a curiosity gap or pattern break (micro-contrast or counterintuitive angle).\n"
+    "- NO generic question templates (e.g., 'Ever wonder…', 'Are you…', 'Have you ever…', 'Did you know…').\n"
+    "- NO bullets, NO markdown, NO bold, NO emojis, NO quotes, NO hashtags, NO extra text.\n"
+    "Format example (style, not content):\n"
+    "Hook: You open Instagram and your ideas vanish—try this 10-second prompt.\n"
 )
 BODY_SYSTEM_PROMPT = (
     "You are a professional IG Reels BODY writer. "
@@ -99,7 +107,7 @@ def build_user_prompt(
     guidance = (
         " Make it sound like spoken language, not an essay. "
         "Include one emotional shift and at least one concrete example or 2–3 steps "
-        "relevant to my audience level. Keep total length ~90–120 words."
+        "relevant to my audience level. Keep total length ~80–110 words."
     )
     return base + specific + guidance
 
@@ -231,7 +239,10 @@ def _normalize_sections(text: str) -> str:
     t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).rstrip()
     return t
 
-# --- Premium output sanitizers ------------------------------------------------
+# --- Premium output sanitizers & quality gates --------------------------------
+GENERIC_Q_RE = re.compile(r"(?i)\b(ever wonder|have you ever|are you( a)?|did you know|do you)\b")
+YOU_RE = re.compile(r"(?i)\byou(?:r|’re|\'re|\b)")
+
 def _strip_md_noise(s: str) -> str:
     return re.sub(r"[*_`>#~]+", "", (s or "")).strip()
 
@@ -261,24 +272,37 @@ def _tighten_hook(raw: str) -> str:
     t = _extract_after_label(raw, "Hook")
     t = _strip_md_noise(t)
     t = _first_sentence_or_line(t)
-    t = _cap_words(t, 16)  # ~8–16 words
+    t = _cap_words(t, 16)  # target 8–16 words
     return _ensure_end_punct(t)
+
+def _hook_needs_reforge(h: str) -> bool:
+    if not h:
+        return True
+    words = h.split()
+    too_short = len(words) < 8
+    too_long  = len(words) > 18
+    lacks_you = YOU_RE.search(h) is None
+    is_generic_q = GENERIC_Q_RE.search(h) is not None
+    return too_short or too_long or lacks_you or is_generic_q
+
+REFORGE_HOOK_SYSTEM_PROMPT = (
+    "You rewrite hooks to be direct, human, and relatable.\n"
+    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words) addressing ONE viewer using 'you/your'.\n"
+    "Name a concrete pain/desire early; avoid generic questions; no markdown/quotes/emojis.\n"
+)
 
 def _tighten_body(raw: str) -> str:
     t = _extract_after_label(raw, "Body")
     t = _strip_md_noise(t)
-    # collapse bullets if present
-    t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)
-    # compress whitespace
+    t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)  # drop bullets
     t = re.sub(r"\s+", " ", t).strip()
-    # cap around 90 words (target 60–90)
-    t = _cap_words(t, 90)
+    # cap around 80 words (average reel body)
+    t = _cap_words(t, 80)
     return _ensure_end_punct(t)
 
 def _tighten_cta(raw: str) -> str:
     t = _extract_after_label(raw, "CTA")
     t = _strip_md_noise(t)
-    # one or two short lines → just keep concise text
     t = _first_sentence_or_line(t)
     t = _cap_words(t, 20)
     return _ensure_end_punct(t)
@@ -342,6 +366,9 @@ def generate_review(request: HttpRequest):
 
     # ---- Premium stepwise: Hook -> Body -> CTA ----
     if plan == "Premium":
+        body_err = None
+        cta_err = None
+
         # 1) HOOK
         hook_msgs = [
             {"role": "system", "content": HOOK_SYSTEM_PROMPT},
@@ -350,6 +377,19 @@ def generate_review(request: HttpRequest):
         hook_raw, hook_meta, hook_err = generate_with_fallback(hook_msgs)
         if hook_raw:
             hook = _tighten_hook(hook_raw)
+
+            # Quality gate: enforce second-person, non-generic, punchy
+            if _hook_needs_reforge(hook):
+                reforged_raw, _, _ = generate_with_fallback([
+                    {"role": "system", "content": REFORGE_HOOK_SYSTEM_PROMPT},
+                    {"role": "user", "content": (
+                        f"{user_prompt}\n\n"
+                        f"Rewrite this into a direct, second-person, highly relatable one-liner (8–16 words), "
+                        f"no generic questions:\nHook: {hook}"
+                    )},
+                ])
+                if reforged_raw:
+                    hook = _tighten_hook(reforged_raw)
 
             # 2) BODY (conditioned on Hook)
             body_msgs = [
@@ -390,9 +430,7 @@ def generate_review(request: HttpRequest):
             # If Body or CTA failed, fall through to one-shot fallback
             logger.warning(
                 "Stepwise failed (Body/CTA). Falling back to one-shot. hook_err=%s body_err=%s cta_err=%s",
-                hook_err,
-                body_err if 'body_err' in locals() else None,
-                cta_err if 'cta_err' in locals() else None,
+                hook_err, body_err, cta_err
             )
         else:
             logger.warning("Stepwise failed (Hook). Falling back to one-shot. err=%s", hook_err)
@@ -415,10 +453,11 @@ def generate_review(request: HttpRequest):
     return JsonResponse(payload, status=status_code)
 
 # -----------------------------------------------------------------------------
-#                            Health endpoint
+# Health endpoint
 # -----------------------------------------------------------------------------
 def health(_request):
     return JsonResponse({"ok": True})
+
 
 # -----------------------------------------------------------------------------
 #                       Firestore (admin SDK) initialization

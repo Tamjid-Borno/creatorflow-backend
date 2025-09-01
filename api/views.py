@@ -26,16 +26,24 @@ DEBUG_MODE: bool = config("DEBUG", default="false").lower() == "true"
 
 OPENROUTER_API_KEY: str = config("OPENROUTER_API_KEY", default="")
 OPENROUTER_MODEL_PRIMARY: str = config("OPENROUTER_MODEL_PRIMARY", default="openai/gpt-4o-mini")
+# Keep the fallback on a free/cheap tier, but fast.
 OPENROUTER_MODEL_FALLBACK: str = config("OPENROUTER_MODEL_FALLBACK", default="deepseek/deepseek-r1:free")
 APP_PUBLIC_URL: str = config("APP_PUBLIC_URL", default="http://127.0.0.1:8000")
 
-# Keep app-level ceilings BELOW your Gunicorn timeout
-CONNECT_TIMEOUT: float = float(config("LLM_CONNECT_TIMEOUT", default="10"))
-READ_TIMEOUT: float = float(config("LLM_READ_TIMEOUT", default="35"))
+# Keep app-level ceilings BELOW your Gunicorn timeout (see gunicorn.conf.py).
+# We will still enforce a hard end-to-end budget per request (TOTAL_LLM_BUDGET_MS).
+CONNECT_TIMEOUT: float = float(config("LLM_CONNECT_TIMEOUT", default="5"))
+READ_TIMEOUT: float = float(config("LLM_READ_TIMEOUT", default="20"))
 
-MAX_RETRIES: int = int(config("LLM_MAX_RETRIES", default="2"))
-RETRY_BACKOFF_SECONDS: float = float(config("LLM_RETRY_BACKOFF_SECONDS", default="0.8"))
+# Retries are *total per call*; we also have a global per-request budget below.
+# Keep small to avoid getting killed by the web worker.
+MAX_RETRIES: int = int(config("LLM_MAX_RETRIES", default="0"))  # 0 => single attempt
+RETRY_BACKOFF_SECONDS: float = float(config("LLM_RETRY_BACKOFF_SECONDS", default="0.6"))
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+# End-to-end LLM time budget for the entire Django view (primary+fallback+any stepwise), in ms.
+# View returns with 504 before exceeding Gunicorn's timeout.
+TOTAL_LLM_BUDGET_MS: int = int(config("TOTAL_LLM_BUDGET_MS", default="22000"))
 
 MODEL_TEMPERATURE: float = float(config("MODEL_TEMPERATURE", default="0.7"))
 MODEL_TOP_P: float = float(config("MODEL_TOP_P", default="0.9"))
@@ -118,11 +126,26 @@ def build_user_prompt(
     return base + specific + guidance
 
 
-def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+def _now_monotonic() -> float:
+    return time.monotonic()
+
+
+def _remaining_seconds(deadline_s: Optional[float]) -> Optional[float]:
+    if deadline_s is None:
+        return None
+    return max(0.0, deadline_s - _now_monotonic())
+
+
+def call_openrouter(
+    messages: List[Dict[str, str]],
+    model: str,
+    *,
+    deadline_s: Optional[float] = None
+) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
     """
-    Calls a specific OpenRouter model with retries on transient errors.
-    Returns (content, meta, error). If error and status == 402, code is PAYMENT_REQUIRED
-    so callers can fast-fail instead of wasting time on further calls.
+    Calls a specific OpenRouter model with retries on transient errors,
+    but **never** exceeds the provided deadline_s (monotonic seconds).
+    Returns (content, meta, error). For 402, returns code PAYMENT_REQUIRED immediately.
     """
     if not OPENROUTER_API_KEY:
         return None, {"status": 0, "tries": 0, "latency_ms": 0, "model": model}, {
@@ -147,19 +170,41 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
     }
 
     tries = 0
-    start = time.time()
+    start_wall = time.time()
+    start_mono = _now_monotonic()
     last_status = None
     content = None
     error = None
 
     for attempt in range(MAX_RETRIES + 1):
         tries = attempt + 1
+
+        # Respect the hard budget
+        rem = _remaining_seconds(deadline_s)
+        if rem is not None and rem <= 1.0:
+            error = {"code": "BUDGET_EXCEEDED", "message": "LLM deadline reached before request."}
+            break
+
+        # Compute safe per-attempt timeouts bounded by remaining budget
+        per_connect = CONNECT_TIMEOUT
+        per_read = READ_TIMEOUT
+        if rem is not None:
+            # Leave a small margin to allow response parsing
+            safe = max(1.0, rem - 0.5)
+            per_connect = min(CONNECT_TIMEOUT, max(0.5, safe * 0.25))
+            per_read = min(READ_TIMEOUT, max(0.8, safe * 0.75))
+
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=(per_connect, per_read),
+            )
             last_status = resp.status_code
 
             if resp.status_code >= 400:
-                # Special-case 402 so upstream payment issues short-circuit callers
+                # Special-case 402 to short-circuit callers
                 if resp.status_code == 402:
                     try:
                         upstream = resp.json()
@@ -177,8 +222,21 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
                 except Exception:
                     upstream = {"raw": resp.text[:1000]}
 
+                # Retry only if transient AND we still have time for it
                 if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
-                    time.sleep(RETRY_BACKOFF_SECONDS * tries)
+                    # Backoff but never exceed deadline
+                    sleep_for = RETRY_BACKOFF_SECONDS * tries
+                    if deadline_s is not None:
+                        rem2 = _remaining_seconds(deadline_s)
+                        if rem2 <= sleep_for + 1.0:
+                            # Not enough time left to meaningfully retry
+                            error = {
+                                "code": "UPSTREAM_ERROR",
+                                "message": f"{resp.status_code} from OpenRouter (no time left to retry)",
+                                "upstream": upstream if DEBUG_MODE else {"hint": "Enable DEBUG to see upstream body"},
+                            }
+                            break
+                    time.sleep(sleep_for)
                     continue
 
                 error = {
@@ -203,35 +261,51 @@ def call_openrouter(messages: List[Dict[str, str]], model: str) -> Tuple[Optiona
 
         except requests.Timeout:
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * tries)
+                # Only retry if we have time
+                if deadline_s is not None and _remaining_seconds(deadline_s) <= 1.0:
+                    error = {"code": "UPSTREAM_TIMEOUT", "message": "Model request timed out (no time left)."}
+                    break
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
                 continue
             error = {"code": "UPSTREAM_TIMEOUT", "message": "Model request timed out."}
         except requests.RequestException as e:
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * tries)
+                if deadline_s is not None and _remaining_seconds(deadline_s) <= 1.0:
+                    error = {"code": "UPSTREAM_REQUEST_ERROR", "message": str(e)[:300]}
+                    break
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
                 continue
             error = {"code": "UPSTREAM_REQUEST_ERROR", "message": str(e)[:300]}
         except Exception as e:
             error = {"code": "SERVER_ERROR", "message": str(e)[:300]}
             break
 
-    latency_ms = int((time.time() - start) * 1000)
-    meta = {"status": last_status or 0, "tries": tries, "latency_ms": latency_ms, "model": model}
+    latency_ms = int((_now_monotonic() - start_mono) * 1000)
+    meta = {
+        "status": last_status or 0,
+        "tries": tries,
+        "latency_ms": latency_ms,
+        "model": model,
+        "budget_ms_total": TOTAL_LLM_BUDGET_MS,
+    }
     return content, meta, error
 
 
-def generate_with_fallback(messages: List[Dict[str, str]]) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+def generate_with_fallback(
+    messages: List[Dict[str, str]],
+    *,
+    deadline_s: Optional[float],
+) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
     """
     Try primary; if it fails, do a single-shot on the fallback model.
-    This keeps total request count low and avoids long stepwise cascades when the primary is down/402.
+    Respects the shared deadline.
     """
-    content, meta, err = call_openrouter(messages, OPENROUTER_MODEL_PRIMARY)
+    content, meta, err = call_openrouter(messages, OPENROUTER_MODEL_PRIMARY, deadline_s=deadline_s)
     if content:
         return content, meta, None
 
-    # If the primary is unavailable, call fallback once (single-shot)
     logger.warning("Primary model failed: %s | Falling back to %s", err, OPENROUTER_MODEL_FALLBACK)
-    content2, meta2, err2 = call_openrouter(messages, OPENROUTER_MODEL_FALLBACK)
+    content2, meta2, err2 = call_openrouter(messages, OPENROUTER_MODEL_FALLBACK, deadline_s=deadline_s)
     if content2:
         return content2, meta2, None
     combined_err = {"primary": err, "fallback": err2}
@@ -258,6 +332,7 @@ def _normalize_sections(text: str) -> str:
     - normalize case of 'hook/body/cta' at line starts
     - remove trailing 'undefined' tokens
     - trim stray backticks/markdown fences if any
+    - normalize quotes/asterisks and double-space linebreaks
     """
     if not text:
         return text
@@ -269,6 +344,8 @@ def _normalize_sections(text: str) -> str:
     t = re.sub(r"(?im)^\s*hook\s*:", "Hook:", t)
     t = re.sub(r"(?im)^\s*body\s*:", "Body:", t)
     t = re.sub(r"(?im)^\s*cta\s*:",  "CTA:",  t)
+    t = re.sub(r"[`*]+", "", t)  # strip md emphasis
+    t = re.sub(r" {2,}\n", "\n", t)  # drop markdown hard-breaks
     t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).rstrip()
     return t
 
@@ -332,7 +409,7 @@ def _tighten_body(raw: str) -> str:
     t = _strip_md_noise(t)
     t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)  # drop bullets
     t = re.sub(r"\s+", " ", t).strip()
-    t = _cap_words(t, 80)  # average reel body 60–90 words; cap ~80
+    t = _cap_words(t, 84)  # slightly higher cap to reduce mid-phrase truncation
     return _ensure_end_punct(t)
 
 def _body_needs_reforge(b: str) -> bool:
@@ -435,20 +512,21 @@ def generate_review(request: HttpRequest):
 
     user_prompt = build_user_prompt(niche, sub_category, follower_count, tone, more_specific)
 
+    # Shared hard deadline for the entire view
+    deadline_s = _now_monotonic() + (TOTAL_LLM_BUDGET_MS / 1000.0)
+
     # ---- Premium stepwise: Hook -> Body -> CTA ----
-    # IMPORTANT: We *only* attempt stepwise if the primary is reachable.
-    # If the very first HOOK call on primary fails (e.g., 402), we skip stepwise entirely
-    # and do a single-shot on the fallback to avoid cascading timeouts.
+    # We *only* attempt stepwise if the primary is reachable for HOOK.
     if plan == "Premium":
         body_err = None
         cta_err = None
 
-        # 1) HOOK (PRIMARY ONLY to probe availability)
+        # 1) HOOK (PRIMARY ONLY to probe availability quickly)
         hook_msgs = [
             {"role": "system", "content": HOOK_SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt},
         ]
-        hook_raw, hook_meta, hook_err = call_openrouter(hook_msgs, OPENROUTER_MODEL_PRIMARY)
+        hook_raw, hook_meta, hook_err = call_openrouter(hook_msgs, OPENROUTER_MODEL_PRIMARY, deadline_s=deadline_s)
 
         if hook_raw:
             hook = _tighten_hook(hook_raw)
@@ -462,11 +540,11 @@ def generate_review(request: HttpRequest):
                         f"Rewrite this into a direct, second-person, highly relatable one-liner (8–16 words), "
                         f"no generic questions:\nHook: {hook}"
                     )},
-                ])
+                ], deadline_s=deadline_s)
                 if reforged_raw:
                     hook = _tighten_hook(reforged_raw)
 
-            # 2) BODY (conditioned on Hook) — ok to use fallback now
+            # 2) BODY (conditioned on Hook)
             body_msgs = [
                 {"role": "system", "content": BODY_SYSTEM_PROMPT},
                 {
@@ -474,7 +552,7 @@ def generate_review(request: HttpRequest):
                     "content": f"{user_prompt}\n\nUse this Hook (do not repeat it verbatim):\n{hook}",
                 },
             ]
-            body_raw, body_meta, body_err = generate_with_fallback(body_msgs)
+            body_raw, body_meta, body_err = generate_with_fallback(body_msgs, deadline_s=deadline_s)
 
             if body_raw:
                 body_txt = _tighten_body(body_raw)
@@ -488,7 +566,7 @@ def generate_review(request: HttpRequest):
                             f"Rewrite this Body to be more human, persuasive, and concrete (60–90 words):\n"
                             f"Body: {body_txt}"
                         )},
-                    ])
+                    ], deadline_s=deadline_s)
                     if reforged_body_raw:
                         body_txt = _tighten_body(reforged_body_raw)
 
@@ -500,7 +578,7 @@ def generate_review(request: HttpRequest):
                         "content": f"{user_prompt}\n\nHere is the Body to build a CTA for:\n{body_txt}",
                     },
                 ]
-                cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs)
+                cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs, deadline_s=deadline_s)
 
                 if cta_raw:
                     cta_txt = _tighten_cta(cta_raw)
@@ -513,12 +591,30 @@ def generate_review(request: HttpRequest):
                                 f"{user_prompt}\n\n"
                                 f"Rewrite this CTA to be imperative, viewer-directed, and specific:\nCTA: {cta_txt}"
                             )},
-                        ])
+                        ], deadline_s=deadline_s)
                         if reforged_cta_raw:
                             cta_txt = _tighten_cta(reforged_cta_raw)
 
                     combined = f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}"
                     cleaned = _normalize_sections(combined.strip())
+
+                    # Final total length clamp (80–110 words across all sections)
+                    total_words = len(re.findall(r"\b\w+\b", cleaned))
+                    if total_words > 110:
+                        # Prefer trimming the Body, keep Hook/CTA intact
+                        hook_part = re.search(r"(?is)^Hook:\s*.*?(?=\n\nBody:)", cleaned)
+                        cta_part = re.search(r"(?is)\n\nCTA:\s*.*$", cleaned)
+                        body_part = re.search(r"(?is)\n\nBody:\s*(.*?)(?=\n\nCTA:)", cleaned)
+
+                        if body_part:
+                            body_text_only = body_part.group(1).strip()
+                            # Reduce body by ~15%
+                            body_words = body_text_only.split()
+                            keep = max(50, int(len(body_words) * 0.85))
+                            new_body = " ".join(body_words[:keep]).rstrip(",;:–-") + "…"
+                            cleaned = f"{hook_part.group(0)}\n\nBody: {new_body}\n{cta_part.group(0)}"
+                            cleaned = _normalize_sections(cleaned)
+
                     meta = {
                         "mode": "premium_stepwise",
                         "hook": hook_meta,
@@ -541,11 +637,32 @@ def generate_review(request: HttpRequest):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": user_prompt},
     ]
-    content, meta, upstream_err = generate_with_fallback(messages)
+    content, meta, upstream_err = generate_with_fallback(messages, deadline_s=deadline_s)
     if content:
         cleaned = _normalize_sections(content.strip())
+
+        # Ensure the three labeled sections exist; if not, do a minimal fix.
+        if not re.search(r"(?im)^Hook\s*:", cleaned):
+            cleaned = "Hook: " + _first_sentence_or_line(cleaned) + "\n\n" + cleaned
+        if not re.search(r"(?im)^Body\s*:", cleaned):
+            cleaned = re.sub(r"(?is)^Hook:.*?(?=\n\n)", r"\g<0>", cleaned) + "\n\nBody: " + _extract_after_label(cleaned, "Body")
+        if not re.search(r"(?im)^CTA\s*:", cleaned):
+            cleaned = cleaned.rstrip() + "\n\nCTA: Save this and follow for more."
+
+        cleaned = _normalize_sections(cleaned)
         logger.info("Final cleaned content (single-shot): %r", cleaned[:2000])
         return JsonResponse({"response": cleaned, "meta": {"mode": "single_shot", **meta}}, status=200)
+
+    # If we reach here, we likely ran out of budget or had upstream errors
+    if upstream_err and (
+        upstream_err.get("primary", {}).get("code") == "BUDGET_EXCEEDED"
+        or upstream_err.get("fallback", {}).get("code") == "BUDGET_EXCEEDED"
+        or upstream_err.get("code") == "BUDGET_EXCEEDED"
+    ):
+        return JsonResponse(
+            {"error": "LLM processing timed out", "meta": {"mode": "single_shot", **meta}},
+            status=504,
+        )
 
     status_code = 502
     payload = {"error": "Upstream model failed", "meta": meta}
@@ -558,6 +675,7 @@ def generate_review(request: HttpRequest):
 @csrf_exempt
 def health(request: HttpRequest):
     return JsonResponse({"ok": True, "service": "creatorflow-backend"}, status=200)
+
 
 # -----------------------------------------------------------------------------
 #                       Firestore (admin SDK) initialization

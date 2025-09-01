@@ -26,7 +26,7 @@ DEBUG_MODE: bool = config("DEBUG", default="false").lower() == "true"
 
 OPENROUTER_API_KEY: str = config("OPENROUTER_API_KEY", default="")
 OPENROUTER_MODEL_PRIMARY: str = config("OPENROUTER_MODEL_PRIMARY", default="openai/gpt-4o-mini")
-OPENROUTER_MODEL_FALLBACK: str = config("OPENROUTER_MODEL_FALLBACK", default="meta-llama/llama-3.1-70b-instruct")
+OPENROUTER_MODEL_FALLBACK: str = config("OPENROUTER_MODEL_FALLBACK", default="deepseek/deepseek-r1:free")
 APP_PUBLIC_URL: str = config("APP_PUBLIC_URL", default="http://127.0.0.1:8000")
 
 # Keep app-level ceilings BELOW your Gunicorn timeout
@@ -254,6 +254,7 @@ def _limit_words(text: str, max_words: int = 40) -> str:
 def _normalize_sections(text: str) -> str:
     """
     Fix common model slip-ups:
+    - 'Hok:' -> 'Hook:'
     - normalize case of 'hook/body/cta' at line starts
     - remove trailing 'undefined' tokens
     - trim stray backticks/markdown fences if any
@@ -390,17 +391,16 @@ def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
             firebase_admin.initialize_app()
 
         db = fs.client()
+        logger.info("Firestore initialized successfully.")
 
         if uid:
             snap = db.collection("users").document(uid.strip()).get()
             if snap and snap.exists:
-                logger.info("Firestore initialized successfully.")
                 return snap.to_dict()
 
         if email:
             q = db.collection("users").where("email", "==", email.strip()).limit(1).get()
             if q:
-                logger.info("Firestore initialized successfully.")
                 return q[0].to_dict()
     except Exception:
         logger.exception("Firestore not available or query failed")
@@ -554,12 +554,10 @@ def generate_review(request: HttpRequest):
     return JsonResponse(payload, status=status_code)
 
 
-# Optional tiny health endpoint you can map in urls.py to silence uptime 404s.
+# Simple health endpoint to silence uptime checks and GET /
 @csrf_exempt
 def health(request: HttpRequest):
     return JsonResponse({"ok": True, "service": "creatorflow-backend"}, status=200)
-
-
 
 # -----------------------------------------------------------------------------
 #                       Firestore (admin SDK) initialization

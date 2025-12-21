@@ -98,12 +98,21 @@ TEMPLATES = [
 ]
 
 # ------------------------------------------------------------------------------
-# Database (Render PostgreSQL – DO NOT override SSL)
+# Database (Render PostgreSQL – SAFE SSL HANDLING)
 # ------------------------------------------------------------------------------
-if os.getenv("DATABASE_URL"):
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Ensure sslmode=require is present (Render Postgres needs this)
+    if "sslmode=" not in DATABASE_URL:
+        if "?" in DATABASE_URL:
+            DATABASE_URL += "&sslmode=require"
+        else:
+            DATABASE_URL += "?sslmode=require"
+
     DATABASES = {
-        "default": dj_database_url.config(
-            default=os.getenv("DATABASE_URL"),
+        "default": dj_database_url.parse(
+            DATABASE_URL,
             conn_max_age=600,
         )
     }

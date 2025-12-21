@@ -9,7 +9,7 @@ import dj_database_url
 # ------------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env for local dev (Render uses dashboard env vars)
+# Load .env for local development (Render uses dashboard env vars)
 load_dotenv(BASE_DIR / ".env")
 
 # ------------------------------------------------------------------------------
@@ -21,7 +21,7 @@ def env_bool(key: str, default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
-def env_list(key: str, default: list[str] | None = None) -> list[str]:
+def env_list(key: str, default=None):
     raw = os.getenv(key, "")
     if not raw:
         return default or []
@@ -33,9 +33,10 @@ def env_list(key: str, default: list[str] | None = None) -> list[str]:
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "!!!-dev-only-insecure-key-change-me-!!!")
 DEBUG = env_bool("DJANGO_DEBUG", False)
 
-# Always set ALLOWED_HOSTS via env in prod (Render service URL + any custom domains)
-# Example: ALLOWED_HOSTS=creatorflow-backend420.onrender.com,api.yourdomain.com
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", ["localhost", "127.0.0.1", "[::1]"])
+ALLOWED_HOSTS = env_list(
+    "ALLOWED_HOSTS",
+    ["localhost", "127.0.0.1", "[::1]"]
+)
 
 # ------------------------------------------------------------------------------
 # Installed apps
@@ -47,18 +48,20 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "corsheaders",        # CORS
-    "rest_framework",     # DRF
-    "api",                # your app
+
+    "corsheaders",
+    "rest_framework",
+
+    "api",
 ]
 
 # ------------------------------------------------------------------------------
-# Middleware (CORS must be early; WhiteNoise right after Security)
+# Middleware
 # ------------------------------------------------------------------------------
 MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",            # ← keep early
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
-    "whitenoise.middleware.WhiteNoiseMiddleware",       # serve static in prod
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -90,18 +93,21 @@ TEMPLATES = [
 ]
 
 # ------------------------------------------------------------------------------
-# Database
-#   - Uses DATABASE_URL if provided (e.g., Postgres on Render)
-#   - Falls back to SQLite locally
+# Database (FIXED)
 # ------------------------------------------------------------------------------
 if os.getenv("DATABASE_URL"):
     DATABASES = {
-        "default": dj_database_url.config(
-            default=os.getenv("DATABASE_URL"),
+        "default": dj_database_url.parse(
+            os.getenv("DATABASE_URL"),
             conn_max_age=600,
-            ssl_require=os.getenv("DB_SSL_REQUIRE", "false").lower() in ("1", "true", "yes"),
         )
     }
+
+    # 🚨 CRITICAL FIX: Disable SSL explicitly
+    DATABASES["default"]["OPTIONS"] = {
+        "sslmode": "disable",
+    }
+
 else:
     DATABASES = {
         "default": {
@@ -121,7 +127,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # ------------------------------------------------------------------------------
-# I18N / TZ
+# I18N / Timezone
 # ------------------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -131,73 +137,99 @@ USE_TZ = True
 # ------------------------------------------------------------------------------
 # Static files
 # ------------------------------------------------------------------------------
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
-# WhiteNoise: serve compressed static files in prod
 STORAGES = {
-    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"}
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
+    }
 }
 
 # ------------------------------------------------------------------------------
 # CORS / CSRF
 # ------------------------------------------------------------------------------
-# Explicit origins from env (production)
-#   CORS_ALLOWED_ORIGINS=https://creatorfloww.vercel.app,https://<your-preview>.vercel.app
-CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", ["http://localhost:3000"])
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOWED_ORIGINS = env_list(
+    "CORS_ALLOWED_ORIGINS",
+    ["http://localhost:3000"]
+)
 
-# Allow ALL Vercel previews via regex (keeps production origins strict)
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://.*\.vercel\.app$",
 ]
 
-# CSRF trusted origins must include your frontends.
-# You can add specific domains via env and also allow all vercel.app previews.
+CORS_ALLOW_CREDENTIALS = True
+
 CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [])
 CSRF_TRUSTED_ORIGINS += ["https://*.vercel.app"]
 
 # ------------------------------------------------------------------------------
-# Security headers (safe defaults for production; auto-soften in DEBUG)
+# Security headers
 # ------------------------------------------------------------------------------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = not DEBUG
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
+
 X_FRAME_OPTIONS = "DENY"
-SECURE_HSTS_SECONDS = 60 if not DEBUG else 0          # bump after verifying TLS
+
+SECURE_HSTS_SECONDS = 60 if not DEBUG else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
 SECURE_HSTS_PRELOAD = False
 
 # ------------------------------------------------------------------------------
-# DRF (optional defaults)
+# DRF
 # ------------------------------------------------------------------------------
 REST_FRAMEWORK = {
-    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
-    "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer"
+    ],
+    "DEFAULT_PARSER_CLASSES": [
+        "rest_framework.parsers.JSONParser"
+    ],
 }
 
 # ------------------------------------------------------------------------------
-# Default primary key type
+# Default PK
 # ------------------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ------------------------------------------------------------------------------
-# Third-party / API keys (env driven)
+# Third-party keys
 # ------------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # ------------------------------------------------------------------------------
-# Logging (console-friendly; Render captures stdout)
+# Logging
 # ------------------------------------------------------------------------------
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "formatters": {"simple": {"format": "%(levelname)s %(name)s: %(message)s"}},
-    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "simple"}},
-    "loggers": {
-        "api": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        "django": {"handlers": ["console"], "level": "INFO" if not DEBUG else "DEBUG", "propagate": True},
+    "formatters": {
+        "simple": {
+            "format": "%(levelname)s %(name)s: %(message)s"
+        }
     },
-    "root": {"handlers": ["console"], "level": "WARNING"},
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        }
+    },
+    "loggers": {
+        "api": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django": {
+            "handlers": ["console"],
+            "level": "DEBUG" if DEBUG else "INFO",
+            "propagate": True,
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "WARNING",
+    },
 }

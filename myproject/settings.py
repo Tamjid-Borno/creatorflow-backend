@@ -93,7 +93,7 @@ TEMPLATES = [
 ]
 
 # ------------------------------------------------------------------------------
-# Database (FIXED)
+# Database (FINAL – SSL REQUIRED)
 # ------------------------------------------------------------------------------
 if os.getenv("DATABASE_URL"):
     DATABASES = {
@@ -103,9 +103,9 @@ if os.getenv("DATABASE_URL"):
         )
     }
 
-    # 🚨 CRITICAL FIX: Disable SSL explicitly
+    # ✅ PostgreSQL REQUIRES SSL
     DATABASES["default"]["OPTIONS"] = {
-        "sslmode": "disable",
+        "sslmode": "require",
     }
 
 else:

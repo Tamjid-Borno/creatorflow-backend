@@ -1,49 +1,29 @@
 from pathlib import Path
 import os
-
 import dj_database_url
-from dotenv import load_dotenv
 
 # ------------------------------------------------------------------------------
-# Base directory
+# BASE DIR
 # ------------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env locally (Render ignores this and uses dashboard env vars)
-load_dotenv(BASE_DIR / ".env")
-
 # ------------------------------------------------------------------------------
-# Helpers
+# SECURITY
 # ------------------------------------------------------------------------------
-def env_bool(key: str, default: bool = False) -> bool:
-    val = os.getenv(key)
-    if val is None:
-        return default
-    return val.lower() in ("1", "true", "yes", "on")
-
-def env_list(key: str, default=None):
-    raw = os.getenv(key, "")
-    if not raw:
-        return default or []
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-# ------------------------------------------------------------------------------
-# Core settings
-# ------------------------------------------------------------------------------
-SECRET_KEY = os.getenv(
+SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
-    "!!!-dev-only-insecure-key-change-me-!!!"
+    "dev-insecure-secret-key-change-this",
 )
 
-DEBUG = env_bool("DJANGO_DEBUG", False)
+DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() == "true"
 
-ALLOWED_HOSTS = env_list(
+ALLOWED_HOSTS = os.environ.get(
     "ALLOWED_HOSTS",
-    ["localhost", "127.0.0.1", "[::1]"]
-)
+    "localhost,127.0.0.1",
+).split(",")
 
 # ------------------------------------------------------------------------------
-# Installed apps
+# APPLICATIONS
 # ------------------------------------------------------------------------------
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -53,23 +33,25 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
 
+    # third-party
     "corsheaders",
     "rest_framework",
 
+    # local
     "api",
 ]
 
 # ------------------------------------------------------------------------------
-# Middleware
+# MIDDLEWARE
 # ------------------------------------------------------------------------------
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
 
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -79,7 +61,7 @@ ROOT_URLCONF = "myproject.urls"
 WSGI_APPLICATION = "myproject.wsgi.application"
 
 # ------------------------------------------------------------------------------
-# Templates
+# TEMPLATES
 # ------------------------------------------------------------------------------
 TEMPLATES = [
     {
@@ -98,34 +80,19 @@ TEMPLATES = [
 ]
 
 # ------------------------------------------------------------------------------
-# Database (Render PostgreSQL – SAFE SSL HANDLING)
+# DATABASE (RENDER SAFE – psycopg2 ONLY)
 # ------------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if DATABASE_URL:
-    # Ensure sslmode=require is present (Render Postgres needs this)
-    if "sslmode=" not in DATABASE_URL:
-        if "?" in DATABASE_URL:
-            DATABASE_URL += "&sslmode=require"
-        else:
-            DATABASE_URL += "?sslmode=require"
-
-    DATABASES = {
-        "default": dj_database_url.parse(
-            DATABASE_URL,
-            conn_max_age=600,
-        )
-    }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
+DATABASES = {
+    "default": dj_database_url.parse(
+        os.environ.get("DATABASE_URL"),
+        engine="django.db.backends.postgresql_psycopg2",
+        conn_max_age=600,
+        ssl_require=True,
+    )
+}
 
 # ------------------------------------------------------------------------------
-# Password validation
+# PASSWORD VALIDATION
 # ------------------------------------------------------------------------------
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -135,7 +102,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # ------------------------------------------------------------------------------
-# Internationalization
+# INTERNATIONALIZATION
 # ------------------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -143,7 +110,7 @@ USE_I18N = True
 USE_TZ = True
 
 # ------------------------------------------------------------------------------
-# Static files (WhiteNoise)
+# STATIC FILES
 # ------------------------------------------------------------------------------
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
@@ -155,12 +122,11 @@ STORAGES = {
 }
 
 # ------------------------------------------------------------------------------
-# CORS / CSRF
+# CORS / CSRF (VERCEL + LOCAL)
 # ------------------------------------------------------------------------------
-CORS_ALLOWED_ORIGINS = env_list(
-    "CORS_ALLOWED_ORIGINS",
-    ["http://localhost:3000"]
-)
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+]
 
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://.*\.vercel\.app$",
@@ -168,14 +134,14 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 
 CORS_ALLOW_CREDENTIALS = True
 
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [])
-CSRF_TRUSTED_ORIGINS += ["https://*.vercel.app"]
+CSRF_TRUSTED_ORIGINS = [
+    "https://*.vercel.app",
+]
 
 # ------------------------------------------------------------------------------
-# Security (Render-safe)
+# SECURITY HEADERS (RENDER)
 # ------------------------------------------------------------------------------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-
 SECURE_SSL_REDIRECT = not DEBUG
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
@@ -187,57 +153,30 @@ SECURE_HSTS_PRELOAD = False
 X_FRAME_OPTIONS = "DENY"
 
 # ------------------------------------------------------------------------------
-# Django REST Framework
+# DJANGO REST FRAMEWORK
 # ------------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
     ],
-    "DEFAULT_PARSER_CLASSES": [
-        "rest_framework.parsers.JSONParser",
-    ],
 }
 
 # ------------------------------------------------------------------------------
-# Default primary key
+# DEFAULT PK
 # ------------------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ------------------------------------------------------------------------------
-# Third-party keys
-# ------------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-
-# ------------------------------------------------------------------------------
-# Logging (Render-friendly)
+# LOGGING (RENDER FRIENDLY)
 # ------------------------------------------------------------------------------
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "formatters": {
-        "simple": {
-            "format": "%(levelname)s %(name)s: %(message)s"
-        }
-    },
     "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "simple",
-        }
-    },
-    "loggers": {
-        "django": {
-            "handlers": ["console"],
-            "level": "DEBUG" if DEBUG else "INFO",
-        },
-        "api": {
-            "handlers": ["console"],
-            "level": "INFO",
-            "propagate": False,
-        },
+        "console": {"class": "logging.StreamHandler"},
     },
     "root": {
         "handlers": ["console"],
-        "level": "WARNING",
+        "level": "INFO",
     },
 }

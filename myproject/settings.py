@@ -1,15 +1,15 @@
-# myproject/settings.py
 from pathlib import Path
 import os
-from dotenv import load_dotenv
+
 import dj_database_url
+from dotenv import load_dotenv
 
 # ------------------------------------------------------------------------------
-# Base paths
+# Base directory
 # ------------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env for local development (Render uses dashboard env vars)
+# Load .env locally (Render ignores this and uses dashboard env vars)
 load_dotenv(BASE_DIR / ".env")
 
 # ------------------------------------------------------------------------------
@@ -19,7 +19,7 @@ def env_bool(key: str, default: bool = False) -> bool:
     val = os.getenv(key)
     if val is None:
         return default
-    return str(val).strip().lower() in ("1", "true", "yes", "on")
+    return val.lower() in ("1", "true", "yes", "on")
 
 def env_list(key: str, default=None):
     raw = os.getenv(key, "")
@@ -28,9 +28,13 @@ def env_list(key: str, default=None):
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 # ------------------------------------------------------------------------------
-# Core security & debug
+# Core settings
 # ------------------------------------------------------------------------------
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "!!!-dev-only-insecure-key-change-me-!!!")
+SECRET_KEY = os.getenv(
+    "DJANGO_SECRET_KEY",
+    "!!!-dev-only-insecure-key-change-me-!!!"
+)
+
 DEBUG = env_bool("DJANGO_DEBUG", False)
 
 ALLOWED_HOSTS = env_list(
@@ -62,6 +66,7 @@ MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -93,21 +98,15 @@ TEMPLATES = [
 ]
 
 # ------------------------------------------------------------------------------
-# Database (FINAL – SSL REQUIRED)
+# Database (Render PostgreSQL – DO NOT override SSL)
 # ------------------------------------------------------------------------------
 if os.getenv("DATABASE_URL"):
     DATABASES = {
-        "default": dj_database_url.parse(
-            os.getenv("DATABASE_URL"),
+        "default": dj_database_url.config(
+            default=os.getenv("DATABASE_URL"),
             conn_max_age=600,
         )
     }
-
-    # ✅ PostgreSQL REQUIRES SSL
-    DATABASES["default"]["OPTIONS"] = {
-        "sslmode": "require",
-    }
-
 else:
     DATABASES = {
         "default": {
@@ -127,7 +126,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # ------------------------------------------------------------------------------
-# I18N / Timezone
+# Internationalization
 # ------------------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -135,14 +134,14 @@ USE_I18N = True
 USE_TZ = True
 
 # ------------------------------------------------------------------------------
-# Static files
+# Static files (WhiteNoise)
 # ------------------------------------------------------------------------------
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 STORAGES = {
     "staticfiles": {
-        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     }
 }
 
@@ -164,33 +163,34 @@ CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [])
 CSRF_TRUSTED_ORIGINS += ["https://*.vercel.app"]
 
 # ------------------------------------------------------------------------------
-# Security headers
+# Security (Render-safe)
 # ------------------------------------------------------------------------------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 SECURE_SSL_REDIRECT = not DEBUG
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
-
-X_FRAME_OPTIONS = "DENY"
 
 SECURE_HSTS_SECONDS = 60 if not DEBUG else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
 SECURE_HSTS_PRELOAD = False
 
+X_FRAME_OPTIONS = "DENY"
+
 # ------------------------------------------------------------------------------
-# DRF
+# Django REST Framework
 # ------------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
-        "rest_framework.renderers.JSONRenderer"
+        "rest_framework.renderers.JSONRenderer",
     ],
     "DEFAULT_PARSER_CLASSES": [
-        "rest_framework.parsers.JSONParser"
+        "rest_framework.parsers.JSONParser",
     ],
 }
 
 # ------------------------------------------------------------------------------
-# Default PK
+# Default primary key
 # ------------------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -200,7 +200,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # ------------------------------------------------------------------------------
-# Logging
+# Logging (Render-friendly)
 # ------------------------------------------------------------------------------
 LOGGING = {
     "version": 1,
@@ -217,15 +217,14 @@ LOGGING = {
         }
     },
     "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": "DEBUG" if DEBUG else "INFO",
+        },
         "api": {
             "handlers": ["console"],
             "level": "INFO",
             "propagate": False,
-        },
-        "django": {
-            "handlers": ["console"],
-            "level": "DEBUG" if DEBUG else "INFO",
-            "propagate": True,
         },
     },
     "root": {

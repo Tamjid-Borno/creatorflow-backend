@@ -1,53 +1,48 @@
-# myproject/api/views.py
 from __future__ import annotations
 
+import base64
+import datetime as _dt
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from decouple import config
-from django.http import JsonResponse, HttpRequest
+from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 
 # -----------------------------------------------------------------------------
-# Logging (dev-friendly defaults). In production, rely on settings.py.
+# Logging
 # -----------------------------------------------------------------------------
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-#                OpenRouter (generate-review) configuration
+# OpenRouter configuration
 # -----------------------------------------------------------------------------
 DEBUG_MODE: bool = config("DEBUG", default="false").lower() == "true"
 
 OPENROUTER_API_KEY: str = config("OPENROUTER_API_KEY", default="")
 OPENROUTER_MODEL_PRIMARY: str = config("OPENROUTER_MODEL_PRIMARY", default="openai/gpt-4o-mini")
-# Keep the fallback on a free/cheap tier, but fast.
 OPENROUTER_MODEL_FALLBACK: str = config("OPENROUTER_MODEL_FALLBACK", default="deepseek/deepseek-r1:free")
 APP_PUBLIC_URL: str = config("APP_PUBLIC_URL", default="http://127.0.0.1:8000")
 
-# Keep app-level ceilings BELOW your Gunicorn timeout (see gunicorn.conf.py).
-# We will still enforce a hard end-to-end budget per request (TOTAL_LLM_BUDGET_MS).
 CONNECT_TIMEOUT: float = float(config("LLM_CONNECT_TIMEOUT", default="5"))
 READ_TIMEOUT: float = float(config("LLM_READ_TIMEOUT", default="20"))
 
-# Retries are *total per call*; we also have a global per-request budget below.
-# Keep small to avoid getting killed by the web worker.
-MAX_RETRIES: int = int(config("LLM_MAX_RETRIES", default="0"))  # 0 => single attempt
+MAX_RETRIES: int = int(config("LLM_MAX_RETRIES", default="0"))
 RETRY_BACKOFF_SECONDS: float = float(config("LLM_RETRY_BACKOFF_SECONDS", default="0.6"))
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
-# End-to-end LLM time budget for the entire Django view (primary+fallback+any stepwise), in ms.
-# View returns with 504 before exceeding Gunicorn's timeout.
 TOTAL_LLM_BUDGET_MS: int = int(config("TOTAL_LLM_BUDGET_MS", default="22000"))
 
 MODEL_TEMPERATURE: float = float(config("MODEL_TEMPERATURE", default="0.7"))
 MODEL_TOP_P: float = float(config("MODEL_TOP_P", default="0.9"))
-# Keep responses compact to reduce latency
 MODEL_MAX_TOKENS: int = int(config("MODEL_MAX_TOKENS", default="400"))
 
 SYSTEM_PROMPT = (
@@ -72,7 +67,6 @@ SYSTEM_PROMPT = (
     "- If you produce anything outside the exact Hook/Body/CTA structure, FIX IT and produce only the three sections.\n"
 )
 
-# --- Stepwise (Premium-only) prompts -----------------------------------------
 HOOK_SYSTEM_PROMPT = (
     "You are a professional IG Reels HOOK specialist.\n"
     "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words).\n"
@@ -86,6 +80,7 @@ HOOK_SYSTEM_PROMPT = (
     "Format example (style, not content):\n"
     "Hook: You open Instagram and your ideas vanish—try this 10-second prompt.\n"
 )
+
 BODY_SYSTEM_PROMPT = (
     "You are a professional IG Reels BODY writer. "
     "Return ONLY the Body labeled exactly 'Body:' in around 60–90 words. "
@@ -93,6 +88,7 @@ BODY_SYSTEM_PROMPT = (
     "or vivid moment, then 2–3 concrete, easy steps (benefit-first phrasing). Use spoken cadence and contractions. "
     "Do NOT restate the Hook. No extra sections."
 )
+
 CTA_SYSTEM_PROMPT = (
     "You are a professional IG Reels CTA copywriter. "
     "Return ONLY the CTA labeled exactly 'CTA:' in 1–2 short lines. "
@@ -100,15 +96,115 @@ CTA_SYSTEM_PROMPT = (
     "and keep it frictionless (e.g., 'Save this', 'Comment \"me\"', 'Follow for X'). No extra sections."
 )
 
+REFORGE_HOOK_SYSTEM_PROMPT = (
+    "You rewrite hooks to be direct, human, and relatable.\n"
+    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words) addressing ONE viewer using 'you/your'.\n"
+    "Name a concrete pain/desire early; avoid generic questions; no markdown/quotes/emojis.\n"
+)
+
+REFORGE_BODY_SYSTEM_PROMPT = (
+    "You rewrite the BODY of an IG Reel to be persuasive and human.\n"
+    "Return ONLY 'Body:' followed by ~60–90 words addressing ONE viewer using 'you/your'.\n"
+    "Start with empathy (pain/desire), include a vivid mini-moment or micro-story, "
+    "then give 2–3 concrete steps or a tiny framework with benefit-first phrasing. "
+    "Use short spoken sentences and contractions. Avoid generic openers and buzzwords. No extra sections."
+)
+
+REFORGE_CTA_SYSTEM_PROMPT = (
+    "You rewrite CTAs to be clear, human, and high-converting.\n"
+    "Return ONLY 'CTA:' followed by 1 short line (max ~16 words) speaking to ONE viewer using 'you/your'.\n"
+    "Start with an imperative verb aligned to the Body (e.g., Save, Comment 'me', Follow, DM, Share). "
+    "Keep it frictionless and specific. No emojis, no hashtags, no extra sections."
+)
+
+GENERIC_Q_RE = re.compile(
+    r"(?i)\b(ever wonder|have you ever|are you( a)?|did you know|in today'?s (video|reel)|in this video|let'?s dive in)\b"
+)
+YOU_RE = re.compile(r"(?i)\byou(?:r|’re|'re|\b)")
+ACTION_VERBS_RE = re.compile(
+    r"(?i)\b(save|comment|follow|dm|share|tap|try|use|apply|post|record|write|build|launch|fix|download|grab|join|watch|bookmark)\b"
+)
+
+PLAN_CREDITS = {
+    "Basic": 50,
+    "Pro": 200,
+    "Premium": 1000,
+}
+PAID_PLANS = {"Pro", "Premium"}
+
 # -----------------------------------------------------------------------------
-# Helpers
+# Firebase / Firestore bootstrap
+# -----------------------------------------------------------------------------
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except Exception as _imp_err:
+    firebase_admin = None
+    credentials = None
+    firestore = None
+    logger.warning("firebase_admin not installed or import failed: %s", _imp_err)
+
+fs_db = None
+
+
+def init_firestore():
+    """
+    Initialize Firebase Admin and return Firestore client.
+
+    Priority:
+      1) GOOGLE_APPLICATION_CREDENTIALS_JSON -> raw JSON string
+      2) FIREBASE_SERVICE_ACCOUNT -> raw JSON string OR local file path
+      3) GOOGLE_APPLICATION_CREDENTIALS -> default SDK lookup
+    """
+    global fs_db
+
+    if not firebase_admin or not firestore:
+        logger.warning("Firebase Admin SDK unavailable; Firestore disabled.")
+        fs_db = None
+        return None
+
+    try:
+        if firebase_admin._apps:
+            fs_db = firestore.client()
+            return fs_db
+
+        sa_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+        if sa_json:
+            cred = credentials.Certificate(json.loads(sa_json))
+            firebase_admin.initialize_app(cred)
+        else:
+            sa_env = os.getenv("FIREBASE_SERVICE_ACCOUNT", "").strip()
+            if sa_env:
+                if sa_env.startswith("{"):
+                    cred = credentials.Certificate(json.loads(sa_env))
+                else:
+                    with open(sa_env, "r", encoding="utf-8") as f:
+                        cred = credentials.Certificate(json.load(f))
+                firebase_admin.initialize_app(cred)
+            else:
+                firebase_admin.initialize_app()
+
+        fs_db = firestore.client()
+        logger.info("Firestore initialized successfully.")
+        return fs_db
+
+    except Exception as e:
+        fs_db = None
+        logger.warning("Firestore not available in backend: %s", e)
+        return None
+
+
+init_firestore()
+
+# -----------------------------------------------------------------------------
+# General helpers
 # -----------------------------------------------------------------------------
 def build_user_prompt(
     niche: str,
     sub_category: str,
     follower_count: str,
     tone: str,
-    more_specific: str
+    more_specific: str,
 ) -> str:
     parts = [
         f"I'm creating Reels in the '{niche}' niche" if niche else "I'm creating Reels",
@@ -136,20 +232,148 @@ def _remaining_seconds(deadline_s: Optional[float]) -> Optional[float]:
     return max(0.0, deadline_s - _now_monotonic())
 
 
+def _norm(s: Any) -> str:
+    if not s:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace("\n", " ").replace("\r", " ").strip()
+
+
+def _limit_words(text: str, max_words: int = 40) -> str:
+    words = text.split()
+    return text if len(words) <= max_words else " ".join(words[:max_words])
+
+
+def _normalize_sections(text: str) -> str:
+    if not text:
+        return text
+
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"^```(?:\w+)?\n", "", t)
+    t = re.sub(r"\n```$", "", t)
+    t = re.sub(r"(?im)^\s*hok\s*:", "Hook:", t)
+    t = re.sub(r"(?im)^\s*hook\s*:", "Hook:", t)
+    t = re.sub(r"(?im)^\s*body\s*:", "Body:", t)
+    t = re.sub(r"(?im)^\s*cta\s*:", "CTA:", t)
+    t = re.sub(r"[`*]+", "", t)
+    t = re.sub(r" {2,}\n", "\n", t)
+    t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).rstrip()
+    return t
+
+
+def _strip_md_noise(s: str) -> str:
+    return re.sub(r"[*_`>#~]+", "", (s or "")).strip()
+
+
+def _ensure_end_punct(s: str) -> str:
+    return s if re.search(r"[.!?]$", s or "") else (s + "." if s else s)
+
+
+def _first_sentence_or_line(s: str) -> str:
+    s = (s or "").splitlines()[0].strip()
+    m = re.search(r"^(.+?[.!?])(\s|$)", s)
+    return m.group(1).strip() if m else s
+
+
+def _cap_words(s: str, max_words: int) -> str:
+    words = (s or "").split()
+    if len(words) <= max_words:
+        return s
+    return " ".join(words[:max_words]).rstrip(",;:–-") + "…"
+
+
+def _extract_after_label(text: str, label: str) -> str:
+    t = (text or "").strip()
+    m = re.search(rf"(?is)\b{re.escape(label)}\s*:\s*(.*)", t)
+    if m:
+        t = m.group(1).strip()
+    t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).strip()
+    return t
+
+
+def _tighten_hook(raw: str) -> str:
+    t = _extract_after_label(raw, "Hook")
+    t = _strip_md_noise(t)
+    t = _first_sentence_or_line(t)
+    t = _cap_words(t, 16)
+    return _ensure_end_punct(t)
+
+
+def _hook_needs_reforge(h: str) -> bool:
+    if not h:
+        return True
+    words = h.split()
+    too_short = len(words) < 8
+    too_long = len(words) > 18
+    lacks_you = YOU_RE.search(h) is None
+    is_generic_q = GENERIC_Q_RE.search(h) is not None
+    return too_short or too_long or lacks_you or is_generic_q
+
+
+def _tighten_body(raw: str) -> str:
+    t = _extract_after_label(raw, "Body")
+    t = _strip_md_noise(t)
+    t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = _cap_words(t, 84)
+    return _ensure_end_punct(t)
+
+
+def _body_needs_reforge(b: str) -> bool:
+    if not b:
+        return True
+    words = b.split()
+    too_short = len(words) < 50
+    too_long = len(words) > 100
+    lacks_you = YOU_RE.search(b) is None
+    has_generic = GENERIC_Q_RE.search(b) is not None
+    lacks_action = ACTION_VERBS_RE.search(b) is None
+    return too_short or too_long or lacks_you or has_generic or lacks_action
+
+
+def _tighten_cta(raw: str) -> str:
+    t = _extract_after_label(raw, "CTA")
+    t = _strip_md_noise(t)
+    t = _first_sentence_or_line(t)
+    t = _cap_words(t, 20)
+    return _ensure_end_punct(t)
+
+
+def _cta_needs_reforge(c: str) -> bool:
+    if not c:
+        return True
+    too_long = len(c.split()) > 24
+    lacks_imperative = ACTION_VERBS_RE.search(c) is None
+    lacks_you_hint = YOU_RE.search(c) is None
+    return too_long or lacks_imperative or lacks_you_hint
+
+
+def _parse_labeled_section(text: str, label: str) -> str:
+    cleaned = _normalize_sections(text or "")
+    pattern = rf"(?ims)^\s*{re.escape(label)}\s*:\s*(.*?)(?=^\s*(?:Hook|Body|CTA)\s*:|\Z)"
+    m = re.search(pattern, cleaned)
+    return m.group(1).strip() if m else ""
+
+
+# -----------------------------------------------------------------------------
+# OpenRouter helpers
+# -----------------------------------------------------------------------------
 def call_openrouter(
     messages: List[Dict[str, str]],
     model: str,
     *,
-    deadline_s: Optional[float] = None
+    deadline_s: Optional[float] = None,
 ) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
     """
-    Calls a specific OpenRouter model with retries on transient errors,
-    but **never** exceeds the provided deadline_s (monotonic seconds).
-    Returns (content, meta, error). For 402, returns code PAYMENT_REQUIRED immediately.
+    Call a specific OpenRouter model with retries on transient errors,
+    but never exceed deadline_s.
+    Returns (content, meta, error).
     """
     if not OPENROUTER_API_KEY:
         return None, {"status": 0, "tries": 0, "latency_ms": 0, "model": model}, {
-            "code": "SERVER_CONFIG", "message": "Missing OPENROUTER_API_KEY."
+            "code": "SERVER_CONFIG",
+            "message": "Missing OPENROUTER_API_KEY.",
         }
 
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -170,7 +394,6 @@ def call_openrouter(
     }
 
     tries = 0
-    start_wall = time.time()
     start_mono = _now_monotonic()
     last_status = None
     content = None
@@ -179,17 +402,14 @@ def call_openrouter(
     for attempt in range(MAX_RETRIES + 1):
         tries = attempt + 1
 
-        # Respect the hard budget
         rem = _remaining_seconds(deadline_s)
         if rem is not None and rem <= 1.0:
             error = {"code": "BUDGET_EXCEEDED", "message": "LLM deadline reached before request."}
             break
 
-        # Compute safe per-attempt timeouts bounded by remaining budget
         per_connect = CONNECT_TIMEOUT
         per_read = READ_TIMEOUT
         if rem is not None:
-            # Leave a small margin to allow response parsing
             safe = max(1.0, rem - 0.5)
             per_connect = min(CONNECT_TIMEOUT, max(0.5, safe * 0.25))
             per_read = min(READ_TIMEOUT, max(0.8, safe * 0.75))
@@ -204,12 +424,12 @@ def call_openrouter(
             last_status = resp.status_code
 
             if resp.status_code >= 400:
-                # Special-case 402 to short-circuit callers
+                try:
+                    upstream = resp.json()
+                except Exception:
+                    upstream = {"raw": resp.text[:1000]}
+
                 if resp.status_code == 402:
-                    try:
-                        upstream = resp.json()
-                    except Exception:
-                        upstream = {"raw": resp.text[:1000]}
                     error = {
                         "code": "PAYMENT_REQUIRED",
                         "message": "402 from OpenRouter",
@@ -217,19 +437,11 @@ def call_openrouter(
                     }
                     break
 
-                try:
-                    upstream = resp.json()
-                except Exception:
-                    upstream = {"raw": resp.text[:1000]}
-
-                # Retry only if transient AND we still have time for it
                 if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
-                    # Backoff but never exceed deadline
                     sleep_for = RETRY_BACKOFF_SECONDS * tries
                     if deadline_s is not None:
                         rem2 = _remaining_seconds(deadline_s)
-                        if rem2 <= sleep_for + 1.0:
-                            # Not enough time left to meaningfully retry
+                        if rem2 is not None and rem2 <= sleep_for + 1.0:
                             error = {
                                 "code": "UPSTREAM_ERROR",
                                 "message": f"{resp.status_code} from OpenRouter (no time left to retry)",
@@ -261,21 +473,22 @@ def call_openrouter(
 
         except requests.Timeout:
             if attempt < MAX_RETRIES:
-                # Only retry if we have time
-                if deadline_s is not None and _remaining_seconds(deadline_s) <= 1.0:
+                if deadline_s is not None and (_remaining_seconds(deadline_s) or 0.0) <= 1.0:
                     error = {"code": "UPSTREAM_TIMEOUT", "message": "Model request timed out (no time left)."}
                     break
                 time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
                 continue
             error = {"code": "UPSTREAM_TIMEOUT", "message": "Model request timed out."}
+
         except requests.RequestException as e:
             if attempt < MAX_RETRIES:
-                if deadline_s is not None and _remaining_seconds(deadline_s) <= 1.0:
+                if deadline_s is not None and (_remaining_seconds(deadline_s) or 0.0) <= 1.0:
                     error = {"code": "UPSTREAM_REQUEST_ERROR", "message": str(e)[:300]}
                     break
                 time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
                 continue
             error = {"code": "UPSTREAM_REQUEST_ERROR", "message": str(e)[:300]}
+
         except Exception as e:
             error = {"code": "SERVER_ERROR", "message": str(e)[:300]}
             break
@@ -296,10 +509,6 @@ def generate_with_fallback(
     *,
     deadline_s: Optional[float],
 ) -> Tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
-    """
-    Try primary; if it fails, do a single-shot on the fallback model.
-    Respects the shared deadline.
-    """
     content, meta, err = call_openrouter(messages, OPENROUTER_MODEL_PRIMARY, deadline_s=deadline_s)
     if content:
         return content, meta, None
@@ -308,480 +517,54 @@ def generate_with_fallback(
     content2, meta2, err2 = call_openrouter(messages, OPENROUTER_MODEL_FALLBACK, deadline_s=deadline_s)
     if content2:
         return content2, meta2, None
+
     combined_err = {"primary": err, "fallback": err2}
     return None, meta2, combined_err
 
 
-def _norm(s: Any) -> str:
-    if not s:
-        return ""
-    if not isinstance(s, str):
-        s = str(s)
-    return s.replace("\n", " ").replace("\r", " ").strip()
-
-
-def _limit_words(text: str, max_words: int = 40) -> str:
-    words = text.split()
-    return text if len(words) <= max_words else " ".join(words[:max_words])
-
-
-def _normalize_sections(text: str) -> str:
-    """
-    Fix common model slip-ups:
-    - 'Hok:' -> 'Hook:'
-    - normalize case of 'hook/body/cta' at line starts
-    - remove trailing 'undefined' tokens
-    - trim stray backticks/markdown fences if any
-    - normalize quotes/asterisks and double-space linebreaks
-    """
-    if not text:
-        return text
-
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"^```(?:\w+)?\n", "", t)
-    t = re.sub(r"\n```$", "", t)
-    t = re.sub(r"(?im)^\s*hok\s*:", "Hook:", t)
-    t = re.sub(r"(?im)^\s*hook\s*:", "Hook:", t)
-    t = re.sub(r"(?im)^\s*body\s*:", "Body:", t)
-    t = re.sub(r"(?im)^\s*cta\s*:",  "CTA:",  t)
-    t = re.sub(r"[`*]+", "", t)  # strip md emphasis
-    t = re.sub(r" {2,}\n", "\n", t)  # drop markdown hard-breaks
-    t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).rstrip()
-    return t
-
-# --- Premium output sanitizers & quality gates --------------------------------
-GENERIC_Q_RE = re.compile(r"(?i)\b(ever wonder|have you ever|are you( a)?|did you know|in today'?s (video|reel)|in this video|let'?s dive in)\b")
-YOU_RE = re.compile(r"(?i)\byou(?:r|’re|'re|\b)")
-ACTION_VERBS_RE = re.compile(r"(?i)\b(save|comment|follow|dm|share|tap|try|use|apply|post|record|write|build|launch|fix|download|grab|join|watch|bookmark)\b")
-
-def _strip_md_noise(s: str) -> str:
-    return re.sub(r"[*_`>#~]+", "", (s or "")).strip()
-
-def _ensure_end_punct(s: str) -> str:
-    return s if re.search(r"[.!?]$", s or "") else (s + "." if s else s)
-
-def _first_sentence_or_line(s: str) -> str:
-    s = (s or "").splitlines()[0].strip()
-    m = re.search(r"^(.+?[.!?])(\s|$)", s)
-    return (m.group(1).strip() if m else s)
-
-def _cap_words(s: str, max_words: int) -> str:
-    words = (s or "").split()
-    if len(words) <= max_words:
-        return s
-    return " ".join(words[:max_words]).rstrip(",;:–-") + "…"
-
-def _extract_after_label(text: str, label: str) -> str:
-    t = (text or "").strip()
-    m = re.search(rf"(?is)\b{re.escape(label)}\s*:\s*(.*)", t)
-    if m:
-        t = m.group(1).strip()
-    t = re.sub(r"(?is)(?:\s*\bundefined\b\s*)+\Z", "", t).strip()
-    return t
-
-# --- Hook: tighten + gate + (optional) reforge --------------------------------
-def _tighten_hook(raw: str) -> str:
-    t = _extract_after_label(raw, "Hook")
-    t = _strip_md_noise(t)
-    t = _first_sentence_or_line(t)
-    t = _cap_words(t, 16)  # target 8–16 words
-    return _ensure_end_punct(t)
-
-def _hook_needs_reforge(h: str) -> bool:
-    if not h:
-        return True
-    words = h.split()
-    too_short = len(words) < 8
-    too_long  = len(words) > 18
-    lacks_you = YOU_RE.search(h) is None
-    is_generic_q = GENERIC_Q_RE.search(h) is not None
-    return too_short or too_long or lacks_you or is_generic_q
-
-REFORGE_HOOK_SYSTEM_PROMPT = (
-    "You rewrite hooks to be direct, human, and relatable.\n"
-    "Return ONLY one sentence labeled exactly 'Hook:' (8–16 words) addressing ONE viewer using 'you/your'.\n"
-    "Name a concrete pain/desire early; avoid generic questions; no markdown/quotes/emojis.\n"
-)
-
-# --- Body: tighten + gate + (optional) reforge --------------------------------
-def _tighten_body(raw: str) -> str:
-    t = _extract_after_label(raw, "Body")
-    t = _strip_md_noise(t)
-    t = re.sub(r"^[\-\*\u2022]\s*", "", t, flags=re.MULTILINE)  # drop bullets
-    t = re.sub(r"\s+", " ", t).strip()
-    t = _cap_words(t, 84)  # slightly higher cap to reduce mid-phrase truncation
-    return _ensure_end_punct(t)
-
-def _body_needs_reforge(b: str) -> bool:
-    if not b:
-        return True
-    words = b.split()
-    too_short = len(words) < 50
-    too_long  = len(words) > 100
-    lacks_you = YOU_RE.search(b) is None
-    has_generic = GENERIC_Q_RE.search(b) is not None
-    lacks_action = ACTION_VERBS_RE.search(b) is None
-    return too_short or too_long or lacks_you or has_generic or lacks_action
-
-REFORGE_BODY_SYSTEM_PROMPT = (
-    "You rewrite the BODY of an IG Reel to be persuasive and human.\n"
-    "Return ONLY 'Body:' followed by ~60–90 words addressing ONE viewer using 'you/your'.\n"
-    "Start with empathy (pain/desire), include a vivid mini-moment or micro-story, "
-    "then give 2–3 concrete steps or a tiny framework with benefit-first phrasing. "
-    "Use short spoken sentences and contractions. Avoid generic openers and buzzwords. No extra sections."
-)
-
-# --- CTA: tighten + gate + (optional) reforge ---------------------------------
-def _tighten_cta(raw: str) -> str:
-    t = _extract_after_label(raw, "CTA")
-    t = _strip_md_noise(t)
-    t = _first_sentence_or_line(t)
-    t = _cap_words(t, 20)
-    return _ensure_end_punct(t)
-
-def _cta_needs_reforge(c: str) -> bool:
-    if not c:
-        return True
-    too_long = len(c.split()) > 24
-    lacks_imperative = ACTION_VERBS_RE.search(c) is None
-    lacks_you_hint = YOU_RE.search(c) is None  # prefer addressing the viewer
-    return too_long or lacks_imperative or lacks_you_hint
-
-REFORGE_CTA_SYSTEM_PROMPT = (
-    "You rewrite CTAs to be clear, human, and high-converting.\n"
-    "Return ONLY 'CTA:' followed by 1 short line (max ~16 words) speaking to ONE viewer using 'you/your'.\n"
-    "Start with an imperative verb aligned to the Body (e.g., Save, Comment 'me', Follow, DM, Share). "
-    "Keep it frictionless and specific. No emojis, no hashtags, no extra sections."
-)
-
-# --- Firestore (best-effort) --------------------------------------------------
+# -----------------------------------------------------------------------------
+# Firestore helpers
+# -----------------------------------------------------------------------------
 def _get_user_doc(uid: Optional[str], email: Optional[str]) -> Optional[dict]:
     """
-    Best-effort Firestore fetch. If firebase_admin is not configured, returns None gracefully.
-    Looks up by uid first, then by email.
+    Best-effort Firestore fetch by uid first, then by email.
     """
+    if fs_db is None:
+        return None
+
     try:
-        import firebase_admin
-        from firebase_admin import firestore as fs
-
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
-
-        db = fs.client()
-        logger.info("Firestore initialized successfully.")
-
         if uid:
-            snap = db.collection("users").document(uid.strip()).get()
+            snap = fs_db.collection("users").document(uid.strip()).get()
             if snap and snap.exists:
                 return snap.to_dict()
 
         if email:
-            q = db.collection("users").where("email", "==", email.strip()).limit(1).get()
+            q = fs_db.collection("users").where("email", "==", email.strip()).limit(1).get()
             if q:
                 return q[0].to_dict()
     except Exception:
-        logger.exception("Firestore not available or query failed")
+        logger.exception("Firestore lookup failed")
     return None
 
-# -----------------------------------------------------------------------------
-# View: generate_review
-# -----------------------------------------------------------------------------
-@csrf_exempt
-def generate_review(request: HttpRequest):
-    if request.method != "POST":
-        return JsonResponse({"error": "Only POST allowed."}, status=405)
 
-    try:
-        body = json.loads(request.body.decode("utf-8"))
-    except Exception:
-        return JsonResponse({"error": "Invalid JSON body."}, status=400)
-
-    niche = _norm(body.get("niche", "Instagram"))
-    sub_category = _norm(body.get("subCategory", ""))
-    follower_count = _norm(body.get("followerCount", ""))
-    tone = _norm(body.get("tone", ""))
-    more_specific = _limit_words(_norm(body.get("moreSpecific", "")), 30)
-
-    # Optional identity to detect Premium
-    uid = _norm(body.get("uid", ""))
-    email = _norm(body.get("email", ""))
-
-    # Try to read user doc; if not found, plan stays empty → one-shot path
-    user_doc = _get_user_doc(uid or None, email or None)
-    plan = (user_doc or {}).get("subscriptionPlan", "").strip().title()
-
-    user_prompt = build_user_prompt(niche, sub_category, follower_count, tone, more_specific)
-
-    # Shared hard deadline for the entire view
-    deadline_s = _now_monotonic() + (TOTAL_LLM_BUDGET_MS / 1000.0)
-
-    # ---- Premium stepwise: Hook -> Body -> CTA ----
-    # We *only* attempt stepwise if the primary is reachable for HOOK.
-    if plan == "Premium":
-        body_err = None
-        cta_err = None
-
-        # 1) HOOK (PRIMARY ONLY to probe availability quickly)
-        hook_msgs = [
-            {"role": "system", "content": HOOK_SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ]
-        hook_raw, hook_meta, hook_err = call_openrouter(hook_msgs, OPENROUTER_MODEL_PRIMARY, deadline_s=deadline_s)
-
-        if hook_raw:
-            hook = _tighten_hook(hook_raw)
-
-            # Hook quality gate (second-person, non-generic, punchy)
-            if _hook_needs_reforge(hook):
-                reforged_raw, _, _ = generate_with_fallback([
-                    {"role": "system", "content": REFORGE_HOOK_SYSTEM_PROMPT},
-                    {"role": "user", "content": (
-                        f"{user_prompt}\n\n"
-                        f"Rewrite this into a direct, second-person, highly relatable one-liner (8–16 words), "
-                        f"no generic questions:\nHook: {hook}"
-                    )},
-                ], deadline_s=deadline_s)
-                if reforged_raw:
-                    hook = _tighten_hook(reforged_raw)
-
-            # 2) BODY (conditioned on Hook)
-            body_msgs = [
-                {"role": "system", "content": BODY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"{user_prompt}\n\nUse this Hook (do not repeat it verbatim):\n{hook}",
-                },
-            ]
-            body_raw, body_meta, body_err = generate_with_fallback(body_msgs, deadline_s=deadline_s)
-
-            if body_raw:
-                body_txt = _tighten_body(body_raw)
-
-                # Body quality gate (human, persuasive, concrete)
-                if _body_needs_reforge(body_txt):
-                    reforged_body_raw, _, _ = generate_with_fallback([
-                        {"role": "system", "content": REFORGE_BODY_SYSTEM_PROMPT},
-                        {"role": "user", "content": (
-                            f"{user_prompt}\n\n"
-                            f"Rewrite this Body to be more human, persuasive, and concrete (60–90 words):\n"
-                            f"Body: {body_txt}"
-                        )},
-                    ], deadline_s=deadline_s)
-                    if reforged_body_raw:
-                        body_txt = _tighten_body(reforged_body_raw)
-
-                # 3) CTA (conditioned on Body)
-                cta_msgs = [
-                    {"role": "system", "content": CTA_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"{user_prompt}\n\nHere is the Body to build a CTA for:\n{body_txt}",
-                    },
-                ]
-                cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs, deadline_s=deadline_s)
-
-                if cta_raw:
-                    cta_txt = _tighten_cta(cta_raw)
-
-                    # CTA quality gate (imperative, viewer-directed, concise)
-                    if _cta_needs_reforge(cta_txt):
-                        reforged_cta_raw, _, _ = generate_with_fallback([
-                            {"role": "system", "content": REFORGE_CTA_SYSTEM_PROMPT},
-                            {"role": "user", "content": (
-                                f"{user_prompt}\n\n"
-                                f"Rewrite this CTA to be imperative, viewer-directed, and specific:\nCTA: {cta_txt}"
-                            )},
-                        ], deadline_s=deadline_s)
-                        if reforged_cta_raw:
-                            cta_txt = _tighten_cta(reforged_cta_raw)
-
-                    combined = f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}"
-                    cleaned = _normalize_sections(combined.strip())
-
-                    # Final total length clamp (80–110 words across all sections)
-                    total_words = len(re.findall(r"\b\w+\b", cleaned))
-                    if total_words > 110:
-                        # Prefer trimming the Body, keep Hook/CTA intact
-                        hook_part = re.search(r"(?is)^Hook:\s*.*?(?=\n\nBody:)", cleaned)
-                        cta_part = re.search(r"(?is)\n\nCTA:\s*.*$", cleaned)
-                        body_part = re.search(r"(?is)\n\nBody:\s*(.*?)(?=\n\nCTA:)", cleaned)
-
-                        if body_part:
-                            body_text_only = body_part.group(1).strip()
-                            # Reduce body by ~15%
-                            body_words = body_text_only.split()
-                            keep = max(50, int(len(body_words) * 0.85))
-                            new_body = " ".join(body_words[:keep]).rstrip(",;:–-") + "…"
-                            cleaned = f"{hook_part.group(0)}\n\nBody: {new_body}\n{cta_part.group(0)}"
-                            cleaned = _normalize_sections(cleaned)
-
-                    meta = {
-                        "mode": "premium_stepwise",
-                        "hook": hook_meta,
-                        "body": body_meta,
-                        "cta": cta_meta,
-                    }
-                    logger.info("Premium stepwise content: %r", cleaned[:2000])
-                    return JsonResponse({"response": cleaned, "meta": meta}, status=200)
-
-            # If Body or CTA failed, fall through to one-shot fallback
-            logger.warning(
-                "Stepwise failed (Body/CTA). Falling back to one-shot. hook_err=%s body_err=%s cta_err=%s",
-                hook_err, body_err, cta_err
-            )
-        else:
-            logger.warning("Stepwise skipped: primary unavailable for HOOK (err=%s). Using one-shot fallback.", hook_err)
-
-    # ---- Default / Fallback: one-shot Hook+Body+CTA ----
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_prompt},
-    ]
-    content, meta, upstream_err = generate_with_fallback(messages, deadline_s=deadline_s)
-    if content:
-        cleaned = _normalize_sections(content.strip())
-
-        # Ensure the three labeled sections exist; if not, do a minimal fix.
-        if not re.search(r"(?im)^Hook\s*:", cleaned):
-            cleaned = "Hook: " + _first_sentence_or_line(cleaned) + "\n\n" + cleaned
-        if not re.search(r"(?im)^Body\s*:", cleaned):
-            cleaned = re.sub(r"(?is)^Hook:.*?(?=\n\n)", r"\g<0>", cleaned) + "\n\nBody: " + _extract_after_label(cleaned, "Body")
-        if not re.search(r"(?im)^CTA\s*:", cleaned):
-            cleaned = cleaned.rstrip() + "\n\nCTA: Save this and follow for more."
-
-        cleaned = _normalize_sections(cleaned)
-        logger.info("Final cleaned content (single-shot): %r", cleaned[:2000])
-        return JsonResponse({"response": cleaned, "meta": {"mode": "single_shot", **meta}}, status=200)
-
-    # If we reach here, we likely ran out of budget or had upstream errors
-    if upstream_err and (
-        upstream_err.get("primary", {}).get("code") == "BUDGET_EXCEEDED"
-        or upstream_err.get("fallback", {}).get("code") == "BUDGET_EXCEEDED"
-        or upstream_err.get("code") == "BUDGET_EXCEEDED"
-    ):
-        return JsonResponse(
-            {"error": "LLM processing timed out", "meta": {"mode": "single_shot", **meta}},
-            status=504,
-        )
-
-    status_code = 502
-    payload = {"error": "Upstream model failed", "meta": meta}
-    if DEBUG_MODE and upstream_err:
-        payload["upstream"] = upstream_err
-    return JsonResponse(payload, status=status_code)
-
-
-# Simple health endpoint to silence uptime checks and GET /
-@csrf_exempt
-def health(request: HttpRequest):
-    return JsonResponse({"ok": True, "service": "creatorflow-backend"}, status=200)
-
-
-# -----------------------------------------------------------------------------
-#                       Firestore (admin SDK) initialization
-# -----------------------------------------------------------------------------
-# --- Firebase / Firestore bootstrap ------------------------------------------
-import os
-import json
-import logging
-
-logger = logging.getLogger(__name__)
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-except Exception as _imp_err:
-    firebase_admin = None
-    firestore = None
-    logger.warning("firebase_admin not installed or import failed: %s", _imp_err)
-
-fs_db = None  # global Firestore client
-
-# -------------------------------------------------------------------
-# Plan constants
-# -------------------------------------------------------------------
-PLAN_CREDITS = {
-    "Basic": 50,
-    "Pro": 200,
-    "Premium": 1000,
-}
-PAID_PLANS = {"Pro", "Premium"}
-
-def init_firestore():
+def _fs_set_user(
+    uid_or_email: str,
+    plan: str,
+    *,
+    credits_to_grant: Optional[int],
+    by_uid: bool = True,
+    transaction_id: Optional[str] = None,
+) -> bool:
     """
-    Initialize Firebase Admin using env vars and return a Firestore client.
-
-    Priority:
-      1) GOOGLE_APPLICATION_CREDENTIALS_JSON (raw JSON string in env var)
-      2) FIREBASE_SERVICE_ACCOUNT (JSON one-liner OR file path)
-      3) GOOGLE_APPLICATION_CREDENTIALS (handled by default initialize_app)
-    """
-    global fs_db
-
-    if not firebase_admin or not firestore:
-        logger.warning("Firebase Admin SDK unavailable; Firestore disabled.")
-        fs_db = None
-        return None
-
-    if firebase_admin._apps:
-        # Already initialized
-        fs_db = firestore.client()
-        return fs_db
-
-    try:
-        # Preferred: raw JSON pasted into env var
-        sa_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
-        if sa_json:
-            cred = credentials.Certificate(json.loads(sa_json))
-            firebase_admin.initialize_app(cred)
-
-        else:
-            # Back-compat: FIREBASE_SERVICE_ACCOUNT can be JSON or file path
-            sa_env = os.getenv("FIREBASE_SERVICE_ACCOUNT", "").strip()
-            if sa_env:
-                if sa_env.startswith("{"):
-                    cred = credentials.Certificate(json.loads(sa_env))
-                else:
-                    with open(sa_env, "r", encoding="utf-8") as f:
-                        cred = credentials.Certificate(json.load(f))
-                firebase_admin.initialize_app(cred)
-            else:
-                # Last fallback: GOOGLE_APPLICATION_CREDENTIALS path
-                firebase_admin.initialize_app()
-
-        fs_db = firestore.client()
-        logger.info("Firestore initialized successfully.")
-        return fs_db
-
-    except Exception as e:
-        fs_db = None
-        logger.warning("Firestore not available in backend: %s", e)
-        return None
-
-
-# Initialize on import
-init_firestore()
-
-
-
-# ---------------------------------------------------------------------------
-# Example Firestore helper
-def _fs_set_user(uid_or_email: str, plan: str, *,
-                 credits_to_grant: int | None,
-                 by_uid: bool = True,
-                 transaction_id: str | None = None) -> bool:
-    """
-    Safely set a user's subscription state and credits.
-    - Basic grants its free pack only once per account (freeBasicGranted).
-    - Paid plans grant credits only once per unique transaction_id.
-    - Always sets subscriptionSelected=True and subscriptionPlan=<plan>.
+    Safely set user's subscription state and credits.
+    - Basic grants free pack only once per account (freeBasicGranted)
+    - Paid plans grant credits only once per transaction_id if provided
     """
     if fs_db is None:
         logger.warning("Firestore not initialized")
         return False
 
     try:
-        # locate doc
         if by_uid:
             ref = fs_db.collection("users").document(uid_or_email)
         else:
@@ -799,21 +582,19 @@ def _fs_set_user(uid_or_email: str, plan: str, *,
             "creditDepletedAt": None,
         }
 
-        # ---- BASIC (free pack once)
         if plan == "Basic":
             if not doc.get("freeBasicGranted"):
                 updates["credits"] = PLAN_CREDITS["Basic"]
                 updates["freeBasicGranted"] = True
                 logger.info("Granted Basic free pack")
             else:
-                logger.info("User already claimed Basic free pack, no regrant")
+                logger.info("User already claimed Basic free pack; no regrant")
 
-        # ---- PAID (idempotent by transaction_id)
         elif plan in PAID_PLANS:
             if transaction_id:
                 already = (doc.get("processedTxns") or {}).get(transaction_id)
                 if already:
-                    logger.info("Txn %s already processed, skipping", transaction_id)
+                    logger.info("Txn %s already processed; skipping", transaction_id)
                 else:
                     if credits_to_grant is None:
                         credits_to_grant = PLAN_CREDITS.get(plan, 0)
@@ -822,46 +603,42 @@ def _fs_set_user(uid_or_email: str, plan: str, *,
                     updates["lastPaidTxn"] = transaction_id
                     logger.info("Granted %s plan (txn=%s)", plan, transaction_id)
             else:
-                # fallback: no txn id
                 if credits_to_grant is None:
                     credits_to_grant = PLAN_CREDITS.get(plan, 0)
                 updates["credits"] = credits_to_grant
 
         ref.set(updates, merge=True)
         return True
+
     except Exception as e:
         logger.exception("fs_set_user failed: %s", e)
         return False
 
-# -----------------------------------------------------------------------------
-#                    Paddle webhook helpers & endpoint
-# -----------------------------------------------------------------------------
+
 def _decode_passthrough(value) -> dict:
     """
-    Handle passthrough being either JSON or base64(JSON) or already a dict.
+    Handle passthrough being either raw JSON, base64(JSON), or already a dict.
     """
     if not value:
         return {}
+
     if isinstance(value, dict):
         return value
+
     if isinstance(value, str):
-        # try base64(JSON)
         try:
-            decoded = base64.b64decode(value).decode("utf-8")
+            decoded = base64.b64decode(value, validate=True).decode("utf-8")
             return json.loads(decoded)
         except Exception:
-            # try direct JSON
             try:
                 return json.loads(value)
             except Exception:
                 return {}
+
     return {}
 
+
 def _get_identity_and_plan(data: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Return (uid, email, plan_label) from various Paddle spots.
-    Priority: custom_data/metadata.plan -> passthrough.plan; uid from passthrough.
-    """
     plan_label = (
         (data.get("custom_data") or {}).get("plan")
         or (data.get("metadata") or {}).get("plan")
@@ -870,10 +647,11 @@ def _get_identity_and_plan(data: dict) -> Tuple[Optional[str], Optional[str], Op
 
     passthrough_raw = (
         data.get("passthrough")
-        or (data.get("checkout", {}) or {}).get("passthrough")
-        or (data.get("transaction", {}) or {}).get("passthrough")
+        or (data.get("checkout") or {}).get("passthrough")
+        or (data.get("transaction") or {}).get("passthrough")
     )
     pt = _decode_passthrough(passthrough_raw)
+
     uid = pt.get("uid")
     if not plan_label:
         plan_label = pt.get("plan")
@@ -885,40 +663,34 @@ def _get_identity_and_plan(data: dict) -> Tuple[Optional[str], Optional[str], Op
         or pt.get("email")
     )
 
-    return uid, email, (plan_label.title() if plan_label else None)
+    return uid, email, (plan_label.title() if isinstance(plan_label, str) and plan_label else None)
+
 
 def _infer_plan_from_names(data: dict) -> Optional[str]:
-    """
-    Fallback: infer plan from price/product names when metadata is missing.
-    Looks into:
-      - data.items[0].price.name
-      - data.details.line_items[0].product.name
-    """
     try:
         items = data.get("items") or []
         if items:
-            price = (items[0].get("price") or {})
+            price = items[0].get("price") or {}
             name = (price.get("name") or "").lower()
             if "premium" in name:
                 return "Premium"
             if "pro" in name:
                 return "Pro"
 
-        li = ((data.get("details") or {}).get("line_items") or [])
-        if li:
-            prod_name = (li[0].get("product") or {}).get("name", "").lower()
+        line_items = ((data.get("details") or {}).get("line_items") or [])
+        if line_items:
+            prod_name = ((line_items[0].get("product") or {}).get("name") or "").lower()
             if "premium" in prod_name:
                 return "Premium"
             if "pro" in prod_name:
                 return "Pro"
     except Exception:
         pass
+
     return None
 
+
 def _detect_credits(plan_label: Optional[str], data: dict) -> int:
-    """
-    Map plan to credits; supports amount fallbacks (minor units or strings).
-    """
     if plan_label == "Pro":
         return 200
     if plan_label == "Premium":
@@ -929,18 +701,266 @@ def _detect_credits(plan_label: Optional[str], data: dict) -> int:
         return 200
     if amount in (1669, "16.69", 16.69, "1669"):
         return 1000
-
-    # Your sandbox payload showed 575 (5.00 + 0.75 tax). If you want to treat that as Pro:
     if amount in (575, "5.75", 5.75, "575"):
         return 200
 
     return 0
 
+
+def _extract_transaction_id(data: dict) -> Optional[str]:
+    return (
+        data.get("transaction_id")
+        or data.get("id")
+        or (data.get("transaction") or {}).get("id")
+        or (data.get("checkout") or {}).get("id")
+        or None
+    )
+
+
+def _as_dt(v) -> Optional[_dt.datetime]:
+    """
+    Convert datetime-ish value to timezone-aware UTC datetime.
+    Accepts Firestore datetime or ISO string.
+    """
+    if not v:
+        return None
+
+    if isinstance(v, _dt.datetime):
+        return v if v.tzinfo else v.replace(tzinfo=_dt.timezone.utc)
+
+    try:
+        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _apply_plan_to_user(uid: Optional[str], email: Optional[str], plan: str) -> bool:
+    credits = PLAN_CREDITS.get(plan, 0)
+    updated = False
+
+    if uid:
+        updated = _fs_set_user(uid, plan, credits_to_grant=credits, by_uid=True)
+    if not updated and email:
+        updated = _fs_set_user(email, plan, credits_to_grant=credits, by_uid=False)
+
+    return updated
+
+
+# -----------------------------------------------------------------------------
+# Views
+# -----------------------------------------------------------------------------
+@csrf_exempt
+def generate_review(request: HttpRequest):
+    if request.method != "POST":
+        return JsonResponse({"error": "Only POST allowed."}, status=405)
+
+    try:
+        body = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    niche = _norm(body.get("niche", "Instagram"))
+    sub_category = _norm(body.get("subCategory", ""))
+    follower_count = _norm(body.get("followerCount", ""))
+    tone = _norm(body.get("tone", ""))
+    more_specific = _limit_words(_norm(body.get("moreSpecific", "")), 30)
+
+    uid = _norm(body.get("uid", ""))
+    email = _norm(body.get("email", ""))
+
+    user_doc = _get_user_doc(uid or None, email or None)
+    plan = str((user_doc or {}).get("subscriptionPlan", "")).strip().title()
+
+    user_prompt = build_user_prompt(niche, sub_category, follower_count, tone, more_specific)
+    deadline_s = _now_monotonic() + (TOTAL_LLM_BUDGET_MS / 1000.0)
+
+    if plan == "Premium":
+        body_err = None
+        cta_err = None
+
+        hook_msgs = [
+            {"role": "system", "content": HOOK_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        hook_raw, hook_meta, hook_err = call_openrouter(
+            hook_msgs,
+            OPENROUTER_MODEL_PRIMARY,
+            deadline_s=deadline_s,
+        )
+
+        if hook_raw:
+            hook = _tighten_hook(hook_raw)
+
+            if _hook_needs_reforge(hook):
+                reforged_raw, _, _ = generate_with_fallback(
+                    [
+                        {"role": "system", "content": REFORGE_HOOK_SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{user_prompt}\n\n"
+                                f"Rewrite this into a direct, second-person, highly relatable one-liner (8–16 words), "
+                                f"no generic questions:\nHook: {hook}"
+                            ),
+                        },
+                    ],
+                    deadline_s=deadline_s,
+                )
+                if reforged_raw:
+                    hook = _tighten_hook(reforged_raw)
+
+            body_msgs = [
+                {"role": "system", "content": BODY_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"{user_prompt}\n\nUse this Hook (do not repeat it verbatim):\n{hook}",
+                },
+            ]
+            body_raw, body_meta, body_err = generate_with_fallback(body_msgs, deadline_s=deadline_s)
+
+            if body_raw:
+                body_txt = _tighten_body(body_raw)
+
+                if _body_needs_reforge(body_txt):
+                    reforged_body_raw, _, _ = generate_with_fallback(
+                        [
+                            {"role": "system", "content": REFORGE_BODY_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{user_prompt}\n\n"
+                                    f"Rewrite this Body to be more human, persuasive, and concrete (60–90 words):\n"
+                                    f"Body: {body_txt}"
+                                ),
+                            },
+                        ],
+                        deadline_s=deadline_s,
+                    )
+                    if reforged_body_raw:
+                        body_txt = _tighten_body(reforged_body_raw)
+
+                cta_msgs = [
+                    {"role": "system", "content": CTA_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"{user_prompt}\n\nHere is the Body to build a CTA for:\n{body_txt}",
+                    },
+                ]
+                cta_raw, cta_meta, cta_err = generate_with_fallback(cta_msgs, deadline_s=deadline_s)
+
+                if cta_raw:
+                    cta_txt = _tighten_cta(cta_raw)
+
+                    if _cta_needs_reforge(cta_txt):
+                        reforged_cta_raw, _, _ = generate_with_fallback(
+                            [
+                                {"role": "system", "content": REFORGE_CTA_SYSTEM_PROMPT},
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"{user_prompt}\n\n"
+                                        f"Rewrite this CTA to be imperative, viewer-directed, and specific:\nCTA: {cta_txt}"
+                                    ),
+                                },
+                            ],
+                            deadline_s=deadline_s,
+                        )
+                        if reforged_cta_raw:
+                            cta_txt = _tighten_cta(reforged_cta_raw)
+
+                    cleaned = _normalize_sections(f"Hook: {hook}\n\nBody: {body_txt}\n\nCTA: {cta_txt}".strip())
+
+                    total_words = len(re.findall(r"\b\w+\b", cleaned))
+                    if total_words > 110:
+                        hook_part = re.search(r"(?is)^Hook:\s*.*?(?=\n\nBody:)", cleaned)
+                        cta_part = re.search(r"(?is)\n\nCTA:\s*.*$", cleaned)
+                        body_part = re.search(r"(?is)\n\nBody:\s*(.*?)(?=\n\nCTA:)", cleaned)
+
+                        if hook_part and cta_part and body_part:
+                            body_text_only = body_part.group(1).strip()
+                            body_words = body_text_only.split()
+                            keep = max(50, int(len(body_words) * 0.85))
+                            new_body = " ".join(body_words[:keep]).rstrip(",;:–-") + "…"
+                            cleaned = f"{hook_part.group(0)}\n\nBody: {new_body}{cta_part.group(0)}"
+                            cleaned = _normalize_sections(cleaned)
+
+                    meta = {
+                        "mode": "premium_stepwise",
+                        "hook": hook_meta,
+                        "body": body_meta,
+                        "cta": cta_meta,
+                    }
+                    logger.info("Premium stepwise content: %r", cleaned[:2000])
+                    return JsonResponse({"response": cleaned, "meta": meta}, status=200)
+
+            logger.warning(
+                "Stepwise failed (Body/CTA). Falling back to one-shot. hook_err=%s body_err=%s cta_err=%s",
+                hook_err, body_err, cta_err
+            )
+        else:
+            logger.warning("Stepwise skipped: primary unavailable for HOOK (err=%s). Using one-shot fallback.", hook_err)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    content, meta, upstream_err = generate_with_fallback(messages, deadline_s=deadline_s)
+
+    if content:
+        cleaned = _normalize_sections(content.strip())
+
+        hook = _parse_labeled_section(cleaned, "Hook")
+        body_txt = _parse_labeled_section(cleaned, "Body")
+        cta_txt = _parse_labeled_section(cleaned, "CTA")
+
+        if not hook:
+            hook = _first_sentence_or_line(cleaned) or "You need one better script angle to stop people scrolling."
+        if not body_txt:
+            body_txt = (
+                "Start with one clear pain your viewer already feels. "
+                "Then show one simple shift and give 2 or 3 quick steps they can use right away."
+            )
+        if not cta_txt:
+            cta_txt = "Save this and follow if you want more scripts like this."
+
+        cleaned = _normalize_sections(
+            f"Hook: {_ensure_end_punct(_strip_md_noise(hook))}\n\n"
+            f"Body: {_ensure_end_punct(_strip_md_noise(body_txt))}\n\n"
+            f"CTA: {_ensure_end_punct(_strip_md_noise(cta_txt))}"
+        )
+
+        logger.info("Final cleaned content (single-shot): %r", cleaned[:2000])
+        return JsonResponse({"response": cleaned, "meta": {"mode": "single_shot", **meta}}, status=200)
+
+    if upstream_err and (
+        upstream_err.get("primary", {}).get("code") == "BUDGET_EXCEEDED"
+        or upstream_err.get("fallback", {}).get("code") == "BUDGET_EXCEEDED"
+        or upstream_err.get("code") == "BUDGET_EXCEEDED"
+    ):
+        return JsonResponse(
+            {"error": "LLM processing timed out", "meta": {"mode": "single_shot", **meta}},
+            status=504,
+        )
+
+    status_code = 502
+    payload = {"error": "Upstream model failed", "meta": meta}
+    if DEBUG_MODE and upstream_err:
+        payload["upstream"] = upstream_err
+
+    logger.warning("generate_review failed: %s", upstream_err)
+    return JsonResponse(payload, status=status_code)
+
+
+@csrf_exempt
+def health(request: HttpRequest):
+    return JsonResponse({"ok": True, "service": "creatorflow-backend"}, status=200)
+
+
 @csrf_exempt
 def paddle_webhook(request):
     """
     Receives Paddle Billing webhooks.
-    NOTE: In production, VERIFY the signature from Paddle before trusting payload.
+    In production, verify Paddle signatures before trusting payload.
     """
     if request.method != "POST":
         return HttpResponseBadRequest("POST only")
@@ -952,10 +972,8 @@ def paddle_webhook(request):
         logger.warning("Webhook: invalid JSON")
         return HttpResponseBadRequest("Invalid JSON")
 
-    # Log up to 4000 chars—good for debugging
     logger.info("Paddle webhook payload: %s", body_text[:4000])
 
-    # Paddle Billing wraps: { "event": { "type": "...", "data": {...} } }
     event = payload.get("event") or payload
     event_type = event.get("type") or event.get("name") or "unknown"
     data = event.get("data") or event.get("object") or payload
@@ -964,7 +982,7 @@ def paddle_webhook(request):
         "transaction.completed",
         "subscription.activated",
         "subscription.payment_succeeded",
-        "checkout.completed",  # just in case
+        "checkout.completed",
     }
     if event_type not in interesting:
         return JsonResponse({"ok": True, "ignored": event_type})
@@ -974,10 +992,11 @@ def paddle_webhook(request):
         plan = _infer_plan_from_names(data)
 
     credits = _detect_credits(plan, data)
+    transaction_id = _extract_transaction_id(data)
 
     logger.info(
-        "Parsed -> event=%s uid=%s email=%s plan=%s credits=%s",
-        event_type, uid, email, plan, credits
+        "Parsed -> event=%s uid=%s email=%s plan=%s credits=%s transaction_id=%s",
+        event_type, uid, email, plan, credits, transaction_id
     )
 
     if not plan:
@@ -986,28 +1005,38 @@ def paddle_webhook(request):
 
     updated = False
     if uid:
-        updated = _fs_set_user(uid, plan, credits, by_uid=True)
+        updated = _fs_set_user(
+            uid,
+            plan,
+            credits_to_grant=credits,
+            by_uid=True,
+            transaction_id=transaction_id,
+        )
     if not updated and email:
-        updated = _fs_set_user(email, plan, credits, by_uid=False)
+        updated = _fs_set_user(
+            email,
+            plan,
+            credits_to_grant=credits,
+            by_uid=False,
+            transaction_id=transaction_id,
+        )
 
     if not updated:
         logger.warning("Webhook: no matching Firestore user for uid=%s email=%s", uid, email)
-        # Still return 200 to avoid infinite retries during dev.
         return JsonResponse({"ok": True, "no_user": True})
 
     return JsonResponse({"ok": True})
 
-# -----------------------------------------------------------------------------
-#            Client-side confirmation (Success page) endpoint
-# -----------------------------------------------------------------------------
+
 @csrf_exempt
 def confirm_plan(request):
     """
-    Allows your /checkout/success page to confirm a plan for the *current Firebase UID*.
+    Allows your success page to confirm a plan for the current Firebase UID.
     Body: { "uid": "...", "plan": "Pro"|"Premium"|"Basic" }
     """
     if request.method != "POST":
         return HttpResponseBadRequest("POST only")
+
     try:
         body = json.loads(request.body.decode("utf-8"))
     except Exception:
@@ -1019,31 +1048,15 @@ def confirm_plan(request):
         return HttpResponseBadRequest("Bad uid/plan")
 
     credits = 200 if plan == "Pro" else (1000 if plan == "Premium" else 50)
-    updated = _fs_set_user(uid, plan, credits, by_uid=True)
+    updated = _fs_set_user(uid, plan, credits_to_grant=credits, by_uid=True)
     return JsonResponse({"ok": bool(updated)})
 
-# --- Finalize checkout from success page -------------------------------------
-from django.views.decorators.http import require_POST
-
-PLAN_CREDITS = {"Basic": 50, "Pro": 200, "Premium": 1000}
-
-def _apply_plan_to_user(uid: str | None, email: str | None, plan: str) -> bool:
-    """
-    Tries Firestore by uid first, then by email. Returns True if something was written.
-    """
-    credits = PLAN_CREDITS.get(plan, 0)
-    updated = False
-    if uid:
-        updated = _fs_set_user(uid, plan, credits, by_uid=True)
-    if not updated and email:
-        updated = _fs_set_user(email, plan, credits, by_uid=False)
-    return updated
 
 @csrf_exempt
 @require_POST
 def finalize_checkout(request):
     """
-    Called from SuccessPage.jsx after Paddle checkout success.
+    Called from your success page after Paddle checkout success.
     Marks subscriptionSelected=True and grants plan credits.
     """
     try:
@@ -1051,10 +1064,10 @@ def finalize_checkout(request):
     except Exception:
         return JsonResponse({"ok": False, "error": "invalid_json"}, status=400)
 
-    uid   = (body.get("uid") or "").strip()
+    uid = (body.get("uid") or "").strip()
     email = (body.get("email") or "").strip()
-    plan  = (body.get("plan") or "").strip().title()
-    ptxn  = (body.get("transaction_id") or "").strip()
+    plan = (body.get("plan") or "").strip().title()
+    ptxn = (body.get("transaction_id") or "").strip()
 
     if plan not in PLAN_CREDITS:
         return JsonResponse({"ok": False, "error": "invalid_plan"}, status=400)
@@ -1073,110 +1086,11 @@ def finalize_checkout(request):
     return JsonResponse({"ok": ok})
 
 
-
-# === Auto top-up utilities ===
-# --- Auto top-up after 24h ----------------------------------------------------
-
-
-import json
-import logging
-import datetime as _dt
-from typing import Optional, Tuple
-
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
-
-# If you have a Firestore client elsewhere, import it here:
-# from .firestore import fs_db
-# Ensure fs_db is a global pointing to google.cloud.firestore.Client
-# Example:
-#   from google.cloud import firestore
-#   fs_db = firestore.Client()
-
-logger = logging.getLogger(__name__)
-
-# Map plans to monthly pack sizes
-PLAN_DEFAULTS = {
-    "basic": 50,
-    "pro": 200,
-    "premium": 1000,
-}
-
-
-def _normalize_plan(p: Optional[str]) -> str:
-    return (p or "").strip().lower()
-
-
-def _now_utc() -> str:
-    # Not currently used, but handy for logs/debug
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def _as_dt(v) -> Optional[_dt.datetime]:
-    """
-    Convert Firestore value to timezone-aware datetime (UTC).
-    Accepts:
-      - None
-      - datetime (naive or tz-aware)
-      - ISO strings like '2025-08-23T07:47:00Z' or with offset.
-    """
-    if not v:
-        return None
-    if isinstance(v, _dt.datetime):
-        return v if v.tzinfo else v.replace(tzinfo=_dt.timezone.utc)
-    try:
-        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def _hours_since(ts: Optional[_dt.datetime]) -> float:
-    """
-    Return hours since 'ts'. If ts is None, return a sentinel value.
-    We keep -1.0 for introspection (and include it in the response),
-    but we won't block refills on a missing timestamp anymore.
-    """
-    if not ts:
-        return -1.0
-    now = _dt.datetime.now(_dt.timezone.utc)
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=_dt.timezone.utc)
-    return (now - ts).total_seconds() / 3600.0
-
-
-def _plan_pack(plan_label: str) -> int:
-    return PLAN_DEFAULTS.get(_normalize_plan(plan_label), 0)
-
-
-def _fs_get_user_doc(uid_or_email: str, by_uid: bool = True):
-    """
-    Return (ref, snap) or (None, None).
-    Expects global `fs_db` to be a Firestore client.
-    """
-    if fs_db is None:
-        return None, None
-    try:
-        if by_uid:
-            ref = fs_db.collection("users").document(uid_or_email)
-            snap = ref.get()
-            return (ref, snap) if snap.exists else (None, None)
-        # by email
-        qry = fs_db.collection("users").where("email", "==", uid_or_email).limit(1).get()
-        if qry:
-            snap = qry[0]
-            return snap.reference, snap
-    except Exception as e:
-        logger.exception("Firestore read failed: %s", e)
-    return None, None
-
-
-
 @csrf_exempt
 @require_POST
 def select_basic(request):
     """
-    Downgrade to Basic plan. 
+    Downgrade to Basic plan.
     Does not regrant free credits if already claimed.
     """
     try:
@@ -1184,7 +1098,7 @@ def select_basic(request):
     except Exception:
         return JsonResponse({"ok": False, "error": "invalid_json"}, status=400)
 
-    uid   = (body.get("uid") or "").strip()
+    uid = (body.get("uid") or "").strip()
     email = (body.get("email") or "").strip()
 
     ident = uid or email
@@ -1200,11 +1114,12 @@ def select_basic(request):
     )
     return JsonResponse({"ok": ok})
 
+
 @csrf_exempt
 @require_POST
 def refresh_credits(request):
     """
-    Auto-refill credits after 24h if paid plan balance is 0.
+    Auto-refill credits after 24h if paid-plan balance is 0.
     Also self-heals subscriptionSelected flag for paid users.
     """
     try:
@@ -1212,7 +1127,7 @@ def refresh_credits(request):
     except Exception:
         return JsonResponse({"ok": False, "error": "invalid_json"}, status=400)
 
-    uid   = (body.get("uid") or "").strip()
+    uid = (body.get("uid") or "").strip()
     email = (body.get("email") or "").strip()
 
     ident = uid or email
@@ -1222,7 +1137,6 @@ def refresh_credits(request):
     if fs_db is None:
         return JsonResponse({"ok": False, "error": "fs_unavailable"}, status=500)
 
-    # locate doc
     if uid:
         ref = fs_db.collection("users").document(uid)
     else:
@@ -1234,26 +1148,23 @@ def refresh_credits(request):
     snap = ref.get()
     doc = snap.to_dict() or {}
 
-    plan = (doc.get("subscriptionPlan") or "").title()
+    plan = str(doc.get("subscriptionPlan") or "").title()
     credits = int(doc.get("credits") or 0)
-
     updates = {}
 
-    # self-heal flag
     if plan in PAID_PLANS and not doc.get("subscriptionSelected"):
         updates["subscriptionSelected"] = True
 
-    # refill if paid & empty & 24h passed
     if plan in PAID_PLANS and credits <= 0:
         depleted_at = doc.get("creditDepletedAt")
-        now = datetime.utcnow()
+        now = _dt.datetime.now(_dt.timezone.utc)
 
         if not depleted_at:
-            updates["creditDepletedAt"] = now.isoformat() + "Z"
+            updates["creditDepletedAt"] = now.isoformat().replace("+00:00", "Z")
         else:
             try:
-                last = datetime.fromisoformat(depleted_at.replace("Z", ""))
-                if now - last >= timedelta(hours=24):
+                last = _as_dt(depleted_at)
+                if last is None or now - last >= _dt.timedelta(hours=24):
                     updates["credits"] = PLAN_CREDITS.get(plan, 0)
                     updates["creditDepletedAt"] = None
             except Exception:
@@ -1263,4 +1174,5 @@ def refresh_credits(request):
     if updates:
         ref.set(updates, merge=True)
         return JsonResponse({"ok": True, "updated": True})
+
     return JsonResponse({"ok": True, "updated": False})
